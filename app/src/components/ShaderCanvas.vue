@@ -1,18 +1,25 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { useShader } from '../composables/useShader'
+import { ref, toRef } from 'vue'
+import { useShader, type SceneId } from '../composables/useShader'
+
+const props = defineProps<{
+  scene: SceneId
+}>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
-const { rainAmount, setRainAmount } = useShader(canvasRef)
+const sceneRef = toRef(props, 'scene')
 
-defineExpose({ rainAmount, setRainAmount })
+const controls = useShader(canvasRef, sceneRef)
+
+defineExpose({
+  setIntensity: controls.setIntensity,
+  setBlurAmount: controls.setBlurAmount,
+  setScene: controls.setScene,
+})
 </script>
 
 <template>
-  <canvas
-    ref="canvasRef"
-    class="shader-canvas"
-  />
+  <canvas ref="canvasRef" class="shader-canvas" />
 </template>
 
 <style scoped>

@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "defaultMusic": [],
+  "scenes": {
+    "rain": {
+      "label": "Night Rain",
+      "primary": {
+        "src": "/audio/ambience/rain-primary.mp3",
+        "label": "Rainfall",
+        "trim": 1,
+        "loop": true,
+        "filter": {
+          "type": "lowpass",
+          "frequency": 2600,
+          "q": 0.8
+        }
+      },
+      "texture": {
+        "src": "/audio/ambience/rain-texture.mp3",
+        "label": "Window Hiss",
+        "trim": 0.55,
+        "loop": true,
+        "filter": {
+          "type": "highpass",
+          "frequency": 320,
+          "q": 0.7
+        }
+      },
+      "music": [
+        {
+          "id": "rain-theme",
+          "title": "Rain Theme",
+          "artist": "Replace Me",
+          "src": "/audio/music/rain-theme.mp3",
+          "loop": true,
+          "gain": 0.85,
+          "crossOrigin": "anonymous"
+        }
+      ]
+    }
+  }
+}

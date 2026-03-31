@@ -4,9 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node --import tsx server/index.ts --mode development",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "node --import tsx server/index.ts --mode production"
   },
   "dependencies": {
     "@milkdown/core": "^7.20.0",
@@ -20,16 +20,24 @@
     "@milkdown/theme-nord": "^7.20.0",
     "@milkdown/transformer": "^7.20.0",
     "@types/three": "^0.183.1",
+    "chokidar": "^5.0.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
     "katex": "^0.16.44",
     "three": "^0.183.2",
-    "vue": "^3.5.30"
+    "vue": "^3.5.30",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.2",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
     "@types/node": "^24.12.0",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-vue": "^6.0.5",
     "@vue/tsconfig": "^0.9.0",
     "tailwindcss": "^4.2.2",
+    "tsx": "^4.21.0",
     "typescript": "~5.9.3",
     "vite": "^8.0.1",
     "vue-tsc": "^3.2.5"

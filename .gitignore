@@ -37,3 +37,5 @@ Thumbs.db
 
 # AI agent
 .claude/
+reference shadertoy/
+data/
