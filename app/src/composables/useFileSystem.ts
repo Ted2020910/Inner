@@ -1,23 +1,30 @@
 import { ref, shallowRef, onMounted, onBeforeUnmount, type Ref, type ShallowRef } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { open as openDialog } from '@tauri-apps/plugin-dialog'
 
-const API_BASE = '/api'
-const WS_PATH = '/ws'
-const HANDLE_DB_NAME = 'inner-workspace'
-const HANDLE_STORE_NAME = 'handles'
-const HANDLE_KEY = 'directory-workspace'
-const SERVER_WORKSPACE_NAME = 'Inner/data'
+// ── 常量 ─────────────────────────────────────────────────────────────────────
 
-type WorkspaceKind = 'server' | 'directory'
-type DirectoryPermissionMode = 'read' | 'readwrite'
+const WORKSPACE_NAME_DEFAULT = 'Inner'
 
-interface DirectoryPickerWindow extends Window {
-  showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>
-}
+// ── 类型定义 ─────────────────────────────────────────────────────────────────
 
 export interface FileInfo {
   name: string
   content: string
   lastModified: number
+}
+
+interface FileMeta {
+  name: string
+  lastModified: number
+}
+
+export interface WorkspaceActionResult {
+  ok: boolean
+  cancelled?: boolean
+  message?: string
+  workspaceName?: string
 }
 
 export interface FileSystemControls {
@@ -26,7 +33,7 @@ export interface FileSystemControls {
   isDirty: Ref<boolean>
   isSaving: Ref<boolean>
   isConnected: Ref<boolean>
-  workspaceKind: Ref<WorkspaceKind>
+  workspaceKind: Ref<'tauri'>
   workspaceName: Ref<string>
   supportsDirectoryPicker: boolean
   openFile: (name?: string) => Promise<void>
@@ -35,86 +42,31 @@ export interface FileSystemControls {
   newFile: (name?: string, content?: string) => Promise<void>
   renameFile: (from: string, to: string) => Promise<boolean>
   deleteFile: (name: string) => Promise<void>
-  chooseDirectory: () => Promise<void>
-  useServerWorkspace: () => Promise<void>
+  chooseDirectory: () => Promise<WorkspaceActionResult>
+  useServerWorkspace: () => Promise<WorkspaceActionResult>
   markDirty: () => void
   getContent: () => string
   refreshFileList: () => Promise<void>
+  searchFiles: (query: string) => Promise<FileInfo[]>
 }
+
+// ── 工具函数 ─────────────────────────────────────────────────────────────────
 
 function normalizeFileName(name: string) {
   return name.replace(/\\/g, '/')
 }
 
-function getLastFileStorageKeyFor(workspaceType: WorkspaceKind, workspaceLabel: string) {
-  return `inner:lastFile:${workspaceType}:${workspaceLabel}`
+function getDefaultMarkdownContent(name: string) {
+  const fileName = normalizeFileName(name).split('/').filter(Boolean).pop() ?? name
+  const title = fileName.replace(/\.md$/i, '')
+  return `# ${title}\n\n`
 }
 
-function openHandleDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(HANDLE_DB_NAME, 1)
-    request.onerror = () => reject(request.error)
-    request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(HANDLE_STORE_NAME)) {
-        request.result.createObjectStore(HANDLE_STORE_NAME)
-      }
-    }
-    request.onsuccess = () => resolve(request.result)
-  })
+function getLastFileStorageKey(workspaceName: string) {
+  return `inner:lastFile:tauri:${workspaceName}`
 }
 
-async function loadStoredDirectoryHandle(): Promise<FileSystemDirectoryHandle | null> {
-  try {
-    const db = await openHandleDb()
-    return await new Promise((resolve, reject) => {
-      const transaction = db.transaction(HANDLE_STORE_NAME, 'readonly')
-      const store = transaction.objectStore(HANDLE_STORE_NAME)
-      const request = store.get(HANDLE_KEY)
-      request.onerror = () => reject(request.error)
-      request.onsuccess = () => resolve((request.result as FileSystemDirectoryHandle | undefined) ?? null)
-    })
-  } catch {
-    return null
-  }
-}
-
-async function storeDirectoryHandle(handle: FileSystemDirectoryHandle) {
-  const db = await openHandleDb()
-  await new Promise<void>((resolve, reject) => {
-    const transaction = db.transaction(HANDLE_STORE_NAME, 'readwrite')
-    const store = transaction.objectStore(HANDLE_STORE_NAME)
-    const request = store.put(handle, HANDLE_KEY)
-    request.onerror = () => reject(request.error)
-    request.onsuccess = () => resolve()
-  })
-}
-
-async function clearStoredDirectoryHandle() {
-  try {
-    const db = await openHandleDb()
-    await new Promise<void>((resolve, reject) => {
-      const transaction = db.transaction(HANDLE_STORE_NAME, 'readwrite')
-      const store = transaction.objectStore(HANDLE_STORE_NAME)
-      const request = store.delete(HANDLE_KEY)
-      request.onerror = () => reject(request.error)
-      request.onsuccess = () => resolve()
-    })
-  } catch {
-    // ignore
-  }
-}
-
-async function ensureDirectoryPermission(
-  handle: FileSystemDirectoryHandle,
-  mode: DirectoryPermissionMode,
-) {
-  const options = { mode } as const
-  if ((await handle.queryPermission(options)) === 'granted') {
-    return true
-  }
-
-  return (await handle.requestPermission(options)) === 'granted'
-}
+// ── Composable ────────────────────────────────────────────────────────────────
 
 export function useFileSystem(): FileSystemControls {
   const currentFile = shallowRef<FileInfo | null>(null)
@@ -122,306 +74,156 @@ export function useFileSystem(): FileSystemControls {
   const isDirty = ref(false)
   const isSaving = ref(false)
   const isConnected = ref(false)
-  const workspaceKind = ref<WorkspaceKind>('server')
-  const workspaceName = ref(SERVER_WORKSPACE_NAME)
-  const supportsDirectoryPicker = typeof window !== 'undefined' && 'showDirectoryPicker' in window
+  const workspaceKind = ref<'tauri'>('tauri')
+  const workspaceName = ref(WORKSPACE_NAME_DEFAULT)
 
-  const currentDirectory = shallowRef<FileSystemDirectoryHandle | null>(null)
-  let ws: WebSocket | null = null
-  let shouldReconnectWs = true
+  // Tauri 环境下无需浏览器 showDirectoryPicker（改用原生对话框）
+  const supportsDirectoryPicker = false
 
-  function getLastFileStorageKey() {
-    return getLastFileStorageKeyFor(workspaceKind.value, workspaceName.value)
+  // 存储 Tauri 事件监听器的清理函数
+  const unlisteners: UnlistenFn[] = []
+
+  // ── 获取最后打开的文件 key ──────────────────────────────────────────────────
+
+  function getStorageKey() {
+    return getLastFileStorageKey(workspaceName.value)
   }
 
+  // ── 文件列表工具 ────────────────────────────────────────────────────────────
+
   function updateFileTimestamp(name: string, lastModified: number) {
-    const index = files.value.findIndex((file) => file.name === name)
+    const index = files.value.findIndex((f) => f.name === name)
     if (index >= 0) {
       files.value[index] = { ...files.value[index], lastModified }
     }
   }
 
-  async function fetchFiles(): Promise<FileInfo[]> {
+  // ── Tauri 命令封装 ──────────────────────────────────────────────────────────
+
+  async function tauriListFiles(): Promise<FileMeta[]> {
     try {
-      const res = await fetch(`${API_BASE}/files`)
-      if (!res.ok) return []
-      return await res.json()
+      return await invoke<FileMeta[]>('list_files')
     } catch {
       return []
     }
   }
 
-  async function fetchFile(name: string): Promise<FileInfo | null> {
+  async function tauriReadFile(name: string): Promise<FileInfo | null> {
     try {
-      const res = await fetch(`${API_BASE}/files/${encodeURIComponent(name)}`)
-      if (!res.ok) return null
-      return await res.json()
+      return await invoke<FileInfo>('read_file', { name })
     } catch {
       return null
     }
   }
 
-  async function writeServerFile(name: string, content: string): Promise<boolean> {
+  async function tauriWriteFile(name: string, content: string): Promise<boolean> {
     try {
-      const res = await fetch(`${API_BASE}/files/${encodeURIComponent(name)}`, {
-        method: 'PUT',
-        body: content,
-        headers: { 'Content-Type': 'text/plain' },
-      })
-      return res.ok
-    } catch {
-      return false
-    }
-  }
-
-  async function deleteServerFile(name: string): Promise<boolean> {
-    try {
-      const res = await fetch(`${API_BASE}/files/${encodeURIComponent(name)}`, {
-        method: 'DELETE',
-      })
-      return res.ok
-    } catch {
-      return false
-    }
-  }
-
-  async function renameServerFile(from: string, to: string): Promise<boolean> {
-    try {
-      const res = await fetch(`${API_BASE}/files/${encodeURIComponent(from)}/rename`, {
-        method: 'POST',
-        body: to,
-        headers: { 'Content-Type': 'text/plain' },
-      })
-      return res.ok
-    } catch {
-      return false
-    }
-  }
-
-  async function listDirectoryFiles(
-    root: FileSystemDirectoryHandle,
-    prefix = '',
-  ): Promise<FileInfo[]> {
-    const results: FileInfo[] = []
-
-    for await (const entry of root.values()) {
-      const relativeName = prefix ? `${prefix}/${entry.name}` : entry.name
-
-      if (entry.kind === 'directory') {
-        results.push(...await listDirectoryFiles(entry, relativeName))
-        continue
-      }
-
-      if (!entry.name.endsWith('.md')) continue
-
-      const file = await entry.getFile()
-      results.push({
-        name: normalizeFileName(relativeName),
-        content: '',
-        lastModified: file.lastModified,
-      })
-    }
-
-    return results.sort((a, b) => b.lastModified - a.lastModified)
-  }
-
-  async function getFileHandleFromDirectory(
-    root: FileSystemDirectoryHandle,
-    name: string,
-    create: boolean,
-  ) {
-    const segments = normalizeFileName(name).split('/').filter(Boolean)
-    const fileName = segments.pop()
-
-    if (!fileName) {
-      throw new Error('Invalid file name')
-    }
-
-    let directory = root
-    for (const segment of segments) {
-      directory = await directory.getDirectoryHandle(segment, { create })
-    }
-
-    return directory.getFileHandle(fileName, { create })
-  }
-
-  async function readDirectoryFile(name: string): Promise<FileInfo | null> {
-    const root = currentDirectory.value
-    if (!root) return null
-
-    try {
-      const handle = await getFileHandleFromDirectory(root, name, false)
-      const file = await handle.getFile()
-      return {
-        name: normalizeFileName(name),
-        content: await file.text(),
-        lastModified: file.lastModified,
-      }
-    } catch {
-      return null
-    }
-  }
-
-  async function writeDirectoryFile(name: string, content: string): Promise<boolean> {
-    const root = currentDirectory.value
-    if (!root) return false
-
-    try {
-      const handle = await getFileHandleFromDirectory(root, name, true)
-      const writable = await handle.createWritable()
-      await writable.write(content)
-      await writable.close()
+      await invoke('write_file', { name, content })
       return true
     } catch {
       return false
     }
   }
 
-  async function removeDirectoryFile(name: string): Promise<boolean> {
-    const root = currentDirectory.value
-    if (!root) return false
-
+  async function tauriDeleteFile(name: string): Promise<boolean> {
     try {
-      const segments = normalizeFileName(name).split('/').filter(Boolean)
-      const fileName = segments.pop()
-      if (!fileName) return false
-
-      let parent = root
-      for (const segment of segments) {
-        parent = await parent.getDirectoryHandle(segment, { create: false })
-      }
-
-      await parent.removeEntry(fileName)
-      if (currentFile.value?.name === name) {
-        currentFile.value = null
-      }
+      await invoke('delete_file', { name })
       return true
     } catch {
       return false
     }
   }
 
-  async function renameDirectoryFile(from: string, to: string): Promise<boolean> {
-    const file = await readDirectoryFile(from)
-    if (!file) return false
-
-    const wrote = await writeDirectoryFile(to, file.content)
-    if (!wrote) return false
-
-    return removeDirectoryFile(from)
-  }
-
-  async function restoreLastFileOrDefault() {
-    const lastFile = localStorage.getItem(getLastFileStorageKey())
-    if (lastFile && files.value.find((file) => file.name === lastFile)) {
-      await openFile(lastFile)
-      return
-    }
-
-    if (files.value.length > 0) {
-      await openFile(files.value[0].name)
-      return
-    }
-
-    await newFile()
-  }
-
-  function connectWS() {
-    if (workspaceKind.value !== 'server' || ws) return
-
+  async function tauriRenameFile(from: string, to: string): Promise<boolean> {
     try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      ws = new WebSocket(`${protocol}//${window.location.host}${WS_PATH}`)
-
-      ws.onopen = () => {
-        isConnected.value = true
-      }
-
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data)
-          handleWsMessage(data)
-        } catch {
-          // ignore malformed events
-        }
-      }
-
-      ws.onclose = () => {
-        ws = null
-        isConnected.value = false
-        if (shouldReconnectWs && workspaceKind.value === 'server') {
-          setTimeout(connectWS, 2000)
-        }
-      }
-
-      ws.onerror = () => {
-        isConnected.value = false
-      }
+      await invoke('rename_file', { from, to })
+      return true
     } catch {
-      if (shouldReconnectWs && workspaceKind.value === 'server') {
-        setTimeout(connectWS, 3000)
-      }
+      return false
     }
   }
 
-  function disconnectWS() {
-    shouldReconnectWs = false
-    ws?.close()
-    ws = null
-    isConnected.value = false
+  async function tauriSearchFiles(query: string): Promise<FileInfo[]> {
+    try {
+      return await invoke<FileInfo[]>('search_files', { query })
+    } catch {
+      return []
+    }
   }
 
-  function handleWsMessage(data: any) {
-    if (data.type === 'init') {
-      files.value = data.files
-      return
-    }
+  // ── 文件监听（替代 WebSocket） ──────────────────────────────────────────────
 
-    if (data.type === 'created') {
-      const exists = files.value.find((file) => file.name === data.name)
-      if (!exists) {
-        files.value.unshift({ name: data.name, content: data.content, lastModified: Date.now() })
-      }
-      return
-    }
+  async function registerWatcher() {
+    const onCreate = await listen<{ name: string; content: string; lastModified: number }>(
+      'fs:created',
+      ({ payload }) => {
+        const exists = files.value.find((f) => f.name === payload.name)
+        if (!exists) {
+          files.value.unshift({
+            name: payload.name,
+            content: payload.content,
+            lastModified: payload.lastModified,
+          })
+        }
+      },
+    )
 
-    if (data.type === 'changed') {
-      const index = files.value.findIndex((file) => file.name === data.name)
-      if (index >= 0) {
-        files.value[index] = { ...files.value[index], content: data.content, lastModified: Date.now() }
-      }
+    const onChange = await listen<{ name: string; content: string; lastModified: number }>(
+      'fs:changed',
+      ({ payload }) => {
+        const index = files.value.findIndex((f) => f.name === payload.name)
+        if (index >= 0) {
+          files.value[index] = {
+            ...files.value[index],
+            content: payload.content,
+            lastModified: payload.lastModified,
+          }
+        }
+        if (currentFile.value?.name === payload.name) {
+          currentFile.value = {
+            ...currentFile.value,
+            content: payload.content,
+            lastModified: payload.lastModified,
+          }
+          isDirty.value = false
+        }
+      },
+    )
 
-      const activeFile = currentFile.value
-      if (!activeFile || activeFile.name !== data.name) return
-
-      currentFile.value = {
-        ...activeFile,
-        content: data.content,
-        lastModified: Date.now(),
-      }
-      isDirty.value = false
-      return
-    }
-
-    if (data.type === 'deleted') {
-      files.value = files.value.filter((file) => file.name !== data.name)
-      if (currentFile.value?.name === data.name) {
+    const onDelete = await listen<{ name: string }>('fs:deleted', async ({ payload }) => {
+      files.value = files.value.filter((f) => f.name !== payload.name)
+      if (currentFile.value?.name === payload.name) {
         if (files.value.length > 0) {
-          void openFile(files.value[0].name)
+          await openFile(files.value[0].name)
         } else {
           currentFile.value = null
         }
       }
-    }
+    })
+
+    // 目录被切换时重新加载文件列表
+    const onDirChanged = await listen<string>('fs:dir-changed', async (event) => {
+      workspaceName.value = event.payload.split('/').pop() ?? WORKSPACE_NAME_DEFAULT
+      await refreshFileList()
+      await restoreLastFileOrDefault()
+    })
+
+    unlisteners.push(onCreate, onChange, onDelete, onDirChanged)
+    isConnected.value = true
   }
 
-  async function refreshFileList() {
-    if (workspaceKind.value === 'directory' && currentDirectory.value) {
-      files.value = await listDirectoryFiles(currentDirectory.value)
-      return
-    }
+  // ── 核心操作 ────────────────────────────────────────────────────────────────
 
-    files.value = await fetchFiles()
+  async function refreshFileList() {
+    const metas = await tauriListFiles()
+    // 保持 files 的结构与 FileInfo 一致（content 暂为空，按需读取）
+    files.value = metas.map((m) => ({ name: m.name, content: '', lastModified: m.lastModified }))
+  }
+
+  async function searchFiles(query: string) {
+    const normalizedQuery = query.trim()
+    if (!normalizedQuery) return []
+    return tauriSearchFiles(normalizedQuery)
   }
 
   async function openFile(name?: string) {
@@ -434,34 +236,26 @@ export function useFileSystem(): FileSystemControls {
       }
     }
 
-    const file = workspaceKind.value === 'directory'
-      ? await readDirectoryFile(name)
-      : await fetchFile(name)
-
+    const file = await tauriReadFile(name)
     if (!file) return
 
     currentFile.value = file
     isDirty.value = false
-    localStorage.setItem(getLastFileStorageKey(), name)
+    localStorage.setItem(getStorageKey(), name)
   }
 
-  async function readFileByName(name: string) {
-    return workspaceKind.value === 'directory'
-      ? await readDirectoryFile(name)
-      : await fetchFile(name)
+  async function readFileByName(name: string): Promise<FileInfo | null> {
+    return tauriReadFile(name)
   }
 
-  async function saveFile(contentSnapshot?: string) {
-    if (!currentFile.value || !isDirty.value || isSaving.value) return false
+  async function saveFile(contentSnapshot?: string): Promise<boolean> {
+    if (!currentFile.value || isSaving.value) return false
 
     const fileName = currentFile.value.name
     const snapshot = contentSnapshot ?? currentFile.value.content
-    const saveTarget = workspaceKind.value
     isSaving.value = true
 
-    const ok = saveTarget === 'directory'
-      ? await writeDirectoryFile(fileName, snapshot)
-      : await writeServerFile(fileName, snapshot)
+    const ok = await tauriWriteFile(fileName, snapshot)
 
     isSaving.value = false
     if (!ok) return false
@@ -469,42 +263,31 @@ export function useFileSystem(): FileSystemControls {
     const now = Date.now()
     updateFileTimestamp(fileName, now)
 
-    if (saveTarget === 'directory') {
-      await refreshFileList()
-    }
-
     if (currentFile.value?.name === fileName) {
-      currentFile.value = {
-        ...currentFile.value,
-        content: snapshot,
-        lastModified: now,
-      }
+      currentFile.value = { ...currentFile.value, content: snapshot, lastModified: now }
     }
     isDirty.value = false
-
     return true
   }
 
-  async function newFile(name?: string, content = '') {
+  async function newFile(name?: string, content?: string) {
     if (!name) {
       const date = new Date()
       name = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}.md`
     }
-
     if (!name.endsWith('.md')) name += '.md'
-    const ok = workspaceKind.value === 'directory'
-      ? await writeDirectoryFile(name, content)
-      : await writeServerFile(name, content)
 
+    const nextContent = content ?? getDefaultMarkdownContent(name)
+    const ok = await tauriWriteFile(name, nextContent)
     if (!ok) return
 
-    currentFile.value = { name, content, lastModified: Date.now() }
+    currentFile.value = { name, content: nextContent, lastModified: Date.now() }
     isDirty.value = false
     await refreshFileList()
-    localStorage.setItem(getLastFileStorageKey(), name)
+    localStorage.setItem(getStorageKey(), name)
   }
 
-  async function renameFile(from: string, to: string) {
+  async function renameFile(from: string, to: string): Promise<boolean> {
     const source = normalizeFileName(from).trim()
     let target = normalizeFileName(to).trim()
 
@@ -512,31 +295,21 @@ export function useFileSystem(): FileSystemControls {
     if (!target.endsWith('.md')) target += '.md'
     if (source === target) return true
 
-    const ok = workspaceKind.value === 'directory'
-      ? await renameDirectoryFile(source, target)
-      : await renameServerFile(source, target)
-
+    const ok = await tauriRenameFile(source, target)
     if (!ok) return false
 
     await refreshFileList()
 
     if (currentFile.value?.name === source) {
-      currentFile.value = {
-        ...currentFile.value,
-        name: target,
-      }
-      localStorage.setItem(getLastFileStorageKey(), target)
+      currentFile.value = { ...currentFile.value, name: target }
+      localStorage.setItem(getStorageKey(), target)
     }
-
     return true
   }
 
   async function deleteFile(name: string) {
     const wasCurrent = currentFile.value?.name === name
-    const ok = workspaceKind.value === 'directory'
-      ? await removeDirectoryFile(name)
-      : await deleteServerFile(name)
-
+    const ok = await tauriDeleteFile(name)
     if (!ok) return
 
     await refreshFileList()
@@ -545,83 +318,69 @@ export function useFileSystem(): FileSystemControls {
 
     if (files.value.length > 0) {
       await openFile(files.value[0].name)
+    } else {
+      currentFile.value = null
+      isDirty.value = false
+    }
+  }
+
+  async function restoreLastFileOrDefault() {
+    const lastFile = localStorage.getItem(getStorageKey())
+    if (lastFile && files.value.find((f) => f.name === lastFile)) {
+      await openFile(lastFile)
       return
     }
-
-    currentFile.value = null
-    isDirty.value = false
-  }
-
-  async function activateServerWorkspace() {
-    currentDirectory.value = null
-    workspaceKind.value = 'server'
-    workspaceName.value = SERVER_WORKSPACE_NAME
-    currentFile.value = null
-    files.value = []
-    isDirty.value = false
-    shouldReconnectWs = true
-    connectWS()
-    await refreshFileList()
-    await restoreLastFileOrDefault()
-  }
-
-  async function activateDirectoryWorkspace(handle: FileSystemDirectoryHandle) {
-    disconnectWS()
-    currentDirectory.value = handle
-    workspaceKind.value = 'directory'
-    workspaceName.value = handle.name
-    currentFile.value = null
-    files.value = []
-    isDirty.value = false
-    isConnected.value = true
-    await refreshFileList()
-    await restoreLastFileOrDefault()
-  }
-
-  async function restoreDirectoryWorkspace() {
-    const handle = await loadStoredDirectoryHandle()
-    if (!handle) return false
-
-    const granted = await ensureDirectoryPermission(handle, 'readwrite')
-    if (!granted) {
-      await clearStoredDirectoryHandle()
-      return false
-    }
-
-    await activateDirectoryWorkspace(handle)
-    return true
-  }
-
-  async function chooseDirectory() {
-    const picker = (window as DirectoryPickerWindow).showDirectoryPicker
-    if (!picker) {
-      window.alert('当前浏览器不支持文件夹选择，请使用 Chromium 内核浏览器。')
+    if (files.value.length > 0) {
+      await openFile(files.value[0].name)
       return
     }
+    await newFile()
+  }
 
+  // ── 工作空间切换 ────────────────────────────────────────────────────────────
+
+  /**
+   * 让用户通过原生对话框选择文件夹，并通知 Rust 切换数据目录。
+   * 原接口名称保留，以保持与 App.vue 调用侧的兼容性。
+   */
+  async function chooseDirectory(): Promise<WorkspaceActionResult> {
     try {
-      const handle = await picker.call(window)
-      const granted = await ensureDirectoryPermission(handle, 'readwrite')
-      if (!granted) {
-        window.alert('没有拿到文件夹读写权限，无法作为工作区使用。')
-        return
-      }
+      const selected = await openDialog({ directory: true, multiple: false, title: '选择笔记文件夹' })
+      if (!selected) return { ok: false, cancelled: true }
 
-      await storeDirectoryHandle(handle)
-      await activateDirectoryWorkspace(handle)
+      const path = typeof selected === 'string' ? selected : selected[0]
+      const newName: string = await invoke('set_data_dir', { path })
+
+      workspaceName.value = newName.split(/[/\\]/).pop() ?? newName
+      await refreshFileList()
+      await restoreLastFileOrDefault()
+
+      return { ok: true, workspaceName: workspaceName.value }
     } catch (error) {
-      if ((error as DOMException)?.name === 'AbortError') {
-        return
-      }
-      console.error('[Inner] Failed to open directory workspace', error)
-      window.alert('打开文件夹失败。')
+      console.error('[Inner] Failed to choose directory', error)
+      return { ok: false, message: '选择文件夹失败' }
     }
   }
 
-  async function useServerWorkspace() {
-    await clearStoredDirectoryHandle()
-    await activateServerWorkspace()
+  /**
+   * 切回默认数据目录（App 自身的 app_data_dir/data）。
+   * 原接口名称保留。
+   */
+  async function useServerWorkspace(): Promise<WorkspaceActionResult> {
+    try {
+      const defaultDir: string = await invoke('get_data_dir')
+      workspaceName.value = WORKSPACE_NAME_DEFAULT
+      await invoke('set_data_dir', { path: defaultDir })
+      await refreshFileList()
+      await restoreLastFileOrDefault()
+      return { ok: true, workspaceName: WORKSPACE_NAME_DEFAULT }
+    } catch (error) {
+      console.error('[Inner] Failed to restore default workspace', error)
+      return { ok: false, message: '切换工作空间失败' }
+    }
   }
+
+  // ── 标记脏状态 ──────────────────────────────────────────────────────────────
 
   function markDirty() {
     if (!currentFile.value) return
@@ -632,15 +391,18 @@ export function useFileSystem(): FileSystemControls {
     return currentFile.value?.content ?? ''
   }
 
+  // ── 生命周期 ────────────────────────────────────────────────────────────────
+
   onMounted(async () => {
-    const restored = await restoreDirectoryWorkspace()
-    if (!restored) {
-      await activateServerWorkspace()
-    }
+    await registerWatcher()
+    await refreshFileList()
+    await restoreLastFileOrDefault()
   })
 
   onBeforeUnmount(() => {
-    disconnectWS()
+    unlisteners.forEach((fn) => fn())
+    unlisteners.length = 0
+    isConnected.value = false
   })
 
   return {
@@ -663,5 +425,6 @@ export function useFileSystem(): FileSystemControls {
     markDirty,
     getContent,
     refreshFileList,
+    searchFiles,
   }
 }

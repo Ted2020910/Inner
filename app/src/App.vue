@@ -16,12 +16,20 @@ const FontSelector = defineAsyncComponent(() => import('./components/FontSelecto
 const ThemeToggle = defineAsyncComponent(() => import('./components/ThemeToggle.vue'))
 
 const AUTO_SAVE_IDLE_MS = 10000
+const SIDEBAR_OPEN_STORAGE_KEY = 'inner:sidebar-open'
+const SIDEBAR_SEARCH_STORAGE_KEY = 'inner:sidebar-search'
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'inner:sidebar-collapsed'
+const DRAFT_STORAGE_PREFIX = 'inner:draft'
 
 type EditorHandle = {
   getMarkdown: () => string
   setMarkdown: (content: string) => Promise<void>
   burnAndClear: () => Promise<void>
   transitionTo: (content: string) => Promise<void>
+}
+
+type TopBarHandle = {
+  show: () => void
 }
 
 // ── File system ──
@@ -43,6 +51,7 @@ const {
   workspaceKind,
   workspaceName,
   refreshFileList,
+  searchFiles,
 } = useFileSystem()
 
 function buildDateStamp(date = new Date()) {
@@ -55,6 +64,17 @@ function getTodayJournalName() {
 
 function getTodayJournalTemplate() {
   const title = buildDateStamp()
+  return `# ${title}\n\n`
+}
+
+function getFileTitleFromName(name: string) {
+  const segments = name.replace(/\\/g, '/').split('/').filter(Boolean)
+  const fileName = segments[segments.length - 1] ?? name
+  return fileName.replace(/\.md$/i, '')
+}
+
+function buildInitialFileContent(name: string) {
+  const title = getFileTitleFromName(name)
   return `# ${title}\n\n`
 }
 
@@ -83,6 +103,7 @@ const audio = useAudio(currentScene)
 
 // ── Shader control refs ──
 const shaderRef = ref<InstanceType<typeof ShaderCanvas> | null>(null)
+const topBarRef = ref<TopBarHandle | null>(null)
 const sceneIntensity = ref(0.5)
 const blurAmount = ref(0.5)
 
@@ -105,18 +126,41 @@ watch(fontChoice, (v) => {
 
 watch(currentScene, (value) => {
   localStorage.setItem('inner:scene', value)
-})
+}, { deep: true })
 
 // ── Editor content ──
 const editorRef = ref<EditorHandle | null>(null)
-const isFilePanelOpen = ref(false)
+const isFilePanelOpen = ref(localStorage.getItem(SIDEBAR_OPEN_STORAGE_KEY) === '1')
 const pendingFileTransition = ref(false)
 const deleteTarget = ref<string | null>(null)
 const isDeletingFile = ref(false)
 const isBurningCurrentFile = ref(false)
 const deletePreview = ref('')
 const isDeletePreviewLoading = ref(false)
+const searchQuery = ref(localStorage.getItem(SIDEBAR_SEARCH_STORAGE_KEY) ?? '')
+const searchResults = ref<typeof files.value>([])
+const isSearching = ref(false)
+const collapsedDirectories = ref<string[]>(JSON.parse(localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) ?? '[]'))
+const saveState = ref<'idle' | 'saved'>('idle')
+const notice = ref<{ tone: 'info' | 'success' | 'error'; title: string; message: string } | null>(null)
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+let titleSyncTimer: ReturnType<typeof setTimeout> | null = null
+let isSyncingFileName = false
+let saveStateTimer: ReturnType<typeof setTimeout> | null = null
+let noticeTimer: ReturnType<typeof setTimeout> | null = null
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null
+
+watch(isFilePanelOpen, (value) => {
+  localStorage.setItem(SIDEBAR_OPEN_STORAGE_KEY, value ? '1' : '0')
+})
+
+watch(searchQuery, (value) => {
+  localStorage.setItem(SIDEBAR_SEARCH_STORAGE_KEY, value)
+})
+
+watch(collapsedDirectories, (value) => {
+  localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, JSON.stringify(value))
+}, { deep: true })
 
 function clearAutoSaveTimer() {
   if (autoSaveTimer) {
@@ -138,6 +182,10 @@ function handleSceneChange(value: SceneId) {
 
 function handleToggleFiles() {
   isFilePanelOpen.value = !isFilePanelOpen.value
+}
+
+function revealTopBar() {
+  topBarRef.value?.show()
 }
 
 function buildDeletePreview(content: string) {
@@ -163,12 +211,25 @@ watch(
     clearAutoSaveTimer()
     if (!editor) return
 
-    const nextContent = file?.content ?? ''
+    const draftContent = file?.name ? readStoredDraft(file.name) : null
+    const nextContent = draftContent ?? file?.content ?? ''
     const previousContent = previousFile?.content ?? ''
     const didSwitchFile = Boolean(previousFile?.name && file?.name && previousFile.name !== file.name)
     const didContentChange = previousContent !== nextContent
+    const didRenameOnly = Boolean(
+      previousFile?.name
+      && file?.name
+      && previousFile.name !== file.name
+      && previousFile.content === file.content
+      && previousFile.lastModified === file.lastModified,
+    )
 
     if (!didSwitchFile && !didContentChange && previousFile?.name === file?.name) {
+      pendingFileTransition.value = false
+      return
+    }
+
+    if (didRenameOnly) {
       pendingFileTransition.value = false
       return
     }
@@ -180,10 +241,18 @@ watch(
     }
 
     await editor.setMarkdown(nextContent)
+    if (file?.name && draftContent !== null) {
+      markDirty()
+    }
     pendingFileTransition.value = false
   },
   { immediate: true },
 )
+
+watch(files, () => {
+  if (!searchQuery.value.trim()) return
+  handleSearch(searchQuery.value)
+}, { deep: true })
 
 watch(deleteTarget, async (name) => {
   deletePreview.value = ''
@@ -223,11 +292,89 @@ watch(
   { immediate: true },
 )
 
-function handleKeydown(e: KeyboardEvent) {
+function handleGlobalKeydown(e: KeyboardEvent) {
   if ((e.ctrlKey || e.metaKey) && e.key === 's') {
     e.preventDefault()
     void handleSave()
+    return
   }
+
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+    e.preventDefault()
+    revealTopBar()
+    handleToggleFiles()
+  }
+}
+
+function clearSearchTimer() {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+}
+
+function clearTitleSyncTimer() {
+  if (titleSyncTimer) {
+    clearTimeout(titleSyncTimer)
+    titleSyncTimer = null
+  }
+}
+
+function clearSaveStateTimer() {
+  if (saveStateTimer) {
+    clearTimeout(saveStateTimer)
+    saveStateTimer = null
+  }
+}
+
+function clearNoticeTimer() {
+  if (noticeTimer) {
+    clearTimeout(noticeTimer)
+    noticeTimer = null
+  }
+}
+
+function getDraftStorageKey(fileName: string) {
+  return `${DRAFT_STORAGE_PREFIX}:${workspaceKind.value}:${workspaceName.value}:${fileName}`
+}
+
+function readStoredDraft(fileName: string) {
+  return localStorage.getItem(getDraftStorageKey(fileName))
+}
+
+function writeStoredDraft(fileName: string, content: string) {
+  localStorage.setItem(getDraftStorageKey(fileName), content)
+}
+
+function clearStoredDraft(fileName: string) {
+  localStorage.removeItem(getDraftStorageKey(fileName))
+}
+
+function showSavedState() {
+  saveState.value = 'saved'
+  clearSaveStateTimer()
+  saveStateTimer = setTimeout(() => {
+    saveState.value = 'idle'
+  }, 1200)
+}
+
+function showNotice(
+  tone: 'info' | 'success' | 'error',
+  title: string,
+  message: string,
+  duration = 2600,
+) {
+  notice.value = { tone, title, message }
+  clearNoticeTimer()
+  if (duration <= 0) return
+  noticeTimer = setTimeout(() => {
+    notice.value = null
+  }, duration)
+}
+
+function closeNotice() {
+  clearNoticeTimer()
+  notice.value = null
 }
 
 async function prepareForNewFile() {
@@ -254,7 +401,8 @@ async function handleNewJournal() {
 async function handleNewUntitled() {
   const okToCreate = await prepareForNewFile()
   if (!okToCreate) return
-  await newFile(getNextUntitledName())
+  const name = getNextUntitledName()
+  await newFile(name, buildInitialFileContent(name))
   isFilePanelOpen.value = false
 }
 
@@ -265,13 +413,20 @@ async function handleOpenRequested(name: string) {
   await openFile(name)
   isFilePanelOpen.value = false
 }
-
 async function handleRenameRequested(from: string, to: string) {
   if (!confirmDiscardUnsavedChanges()) return
   clearAutoSaveTimer()
+  const draft = readStoredDraft(from)
   const ok = await renameFile(from, to)
   if (!ok) {
-    window.alert('重命名失败。')
+    window.alert('Rename failed.')
+    return
+  }
+
+  if (draft !== null) {
+    const target = to.endsWith('.md') ? to : `${to}.md`
+    writeStoredDraft(target, draft)
+    clearStoredDraft(from)
   }
 }
 
@@ -288,12 +443,14 @@ function closeDeleteDialog() {
 async function confirmDeleteFile() {
   if (!deleteTarget.value) return
 
+  const target = deleteTarget.value
   clearAutoSaveTimer()
-  pendingFileTransition.value = deleteTarget.value === currentFile.value?.name
+  pendingFileTransition.value = target === currentFile.value?.name
   isDeletingFile.value = true
 
   try {
-    await deleteFile(deleteTarget.value)
+    await deleteFile(target)
+    clearStoredDraft(target)
   } finally {
     isDeletingFile.value = false
     deleteTarget.value = null
@@ -312,7 +469,10 @@ async function handleBurnCurrentFile() {
   try {
     await editorRef.value.burnAndClear()
     markDirty()
-    await saveFile('')
+    const ok = await saveFile('')
+    if (ok && currentFile.value) {
+      clearStoredDraft(currentFile.value.name)
+    }
   } finally {
     isBurningCurrentFile.value = false
   }
@@ -322,24 +482,137 @@ async function handleSave() {
   clearAutoSaveTimer()
   const snapshot = editorRef.value?.getMarkdown()
   if (snapshot === undefined) return
-  await saveFile(snapshot)
+  const ok = await saveFile(snapshot)
+  if (ok) {
+    if (currentFile.value) {
+      clearStoredDraft(currentFile.value.name)
+    }
+    showSavedState()
+  }
+}
+
+function extractPrimaryHeading(markdown: string) {
+  const match = markdown.match(/^#\s+(.+?)\s*$/m)
+  return match?.[1]?.trim() ?? ''
+}
+
+function sanitizeFileStem(value: string) {
+  return value
+    .replace(/[<>:"|?*]/g, '')
+    .replace(/[\\/]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\.$/, '')
+}
+
+function buildSiblingFileName(fileName: string, stem: string) {
+  const segments = fileName.replace(/\\/g, '/').split('/').filter(Boolean)
+  segments[segments.length - 1] = `${stem}.md`
+  return segments.join('/')
+}
+
+function ensureUniqueFileName(targetName: string, currentName: string) {
+  if (!files.value.some((file) => file.name === targetName && file.name !== currentName)) {
+    return targetName
+  }
+
+  const stem = getFileTitleFromName(targetName)
+  let index = 2
+  let candidate = buildSiblingFileName(currentName, `${stem}-${index}`)
+
+  while (files.value.some((file) => file.name === candidate && file.name !== currentName)) {
+    index += 1
+    candidate = buildSiblingFileName(currentName, `${stem}-${index}`)
+  }
+
+  return candidate
+}
+
+async function syncFileNameWithHeading(markdown: string) {
+  const activeFile = currentFile.value
+  if (!activeFile || isSyncingFileName) return
+
+  const heading = sanitizeFileStem(extractPrimaryHeading(markdown))
+  if (!heading) return
+
+  const currentStem = getFileTitleFromName(activeFile.name)
+  if (heading === currentStem) return
+
+  const nextName = ensureUniqueFileName(buildSiblingFileName(activeFile.name, heading), activeFile.name)
+  if (nextName === activeFile.name) return
+
+  isSyncingFileName = true
+  try {
+    await renameFile(activeFile.name, nextName)
+  } finally {
+    isSyncingFileName = false
+  }
+}
+
+function scheduleTitleSync() {
+  clearTitleSyncTimer()
+  titleSyncTimer = setTimeout(async () => {
+    const snapshot = editorRef.value?.getMarkdown()
+    if (!snapshot) return
+    await syncFileNameWithHeading(snapshot)
+  }, 450)
+}
+
+function handleSearch(query: string) {
+  searchQuery.value = query
+  clearSearchTimer()
+
+  const normalized = query.trim()
+  if (!normalized) {
+    isSearching.value = false
+    searchResults.value = []
+    return
+  }
+
+  isSearching.value = true
+  searchTimer = setTimeout(async () => {
+    searchResults.value = await searchFiles(normalized)
+    isSearching.value = false
+  }, 200)
+}
+
+function handleToggleDirectory(path: string) {
+  collapsedDirectories.value = collapsedDirectories.value.includes(path)
+    ? collapsedDirectories.value.filter((entry) => entry !== path)
+    : [...collapsedDirectories.value, path]
 }
 
 async function handlePickFolder() {
   if (!confirmDiscardUnsavedChanges()) return
   clearAutoSaveTimer()
-  await chooseDirectory()
+  const result = await chooseDirectory()
+  if (result.cancelled) return
+  if (result.ok) {
+    showNotice('success', 'Folder Opened', `Workspace switched to ${result.workspaceName ?? 'folder'}.`)
+    return
+  }
+  showNotice('error', 'Open Folder Failed', result.message ?? 'Failed to open the selected folder.')
 }
 
 async function handleUseServerWorkspace() {
   if (!confirmDiscardUnsavedChanges()) return
   clearAutoSaveTimer()
-  await useServerWorkspace()
+  const result = await useServerWorkspace()
+  if (result.ok) {
+    showNotice('info', 'Workspace Changed', `Using ${result.workspaceName ?? 'built-in workspace'}.`)
+  }
 }
 
 function handleEditorDirty() {
   markDirty()
+  if (currentFile.value) {
+    const snapshot = editorRef.value?.getMarkdown()
+    if (snapshot !== undefined) {
+      writeStoredDraft(currentFile.value.name, snapshot)
+    }
+  }
   scheduleAutoSave()
+  scheduleTitleSync()
 }
 
 function toggleAudio() {
@@ -355,22 +628,38 @@ const glassBlur = computed(() => `${12 + blurAmount.value * 24}px`)
 
 onBeforeUnmount(() => {
   clearAutoSaveTimer()
+  clearSearchTimer()
+  clearTitleSyncTimer()
+  clearSaveStateTimer()
+  clearNoticeTimer()
+  window.removeEventListener('keydown', handleGlobalKeydown)
   window.removeEventListener('beforeunload', handleBeforeUnload)
 })
 
 function handleBeforeUnload(event: BeforeUnloadEvent) {
+  if (currentFile.value) {
+    const snapshot = editorRef.value?.getMarkdown()
+    if (snapshot !== undefined && isDirty.value) {
+      writeStoredDraft(currentFile.value.name, snapshot)
+    }
+  }
+
   if (!isDirty.value) return
   event.preventDefault()
   event.returnValue = ''
 }
 
 onMounted(() => {
+  window.addEventListener('keydown', handleGlobalKeydown)
   window.addEventListener('beforeunload', handleBeforeUnload)
+  if (searchQuery.value.trim()) {
+    handleSearch(searchQuery.value)
+  }
 })
 </script>
 
 <template>
-  <div class="app" @keydown="handleKeydown">
+  <div class="app">
     <!-- Layer 0: WebGL Shader Background -->
     <ShaderCanvas ref="shaderRef" :scene="currentScene" />
 
@@ -379,6 +668,10 @@ onMounted(() => {
 
     <FileSidebar
       :files="files"
+      :search-query="searchQuery"
+      :search-results="searchResults"
+      :is-searching="isSearching"
+      :collapsed-directories="collapsedDirectories"
       :current-file-name="currentFile?.name ?? null"
       :workspace-kind="workspaceKind"
       :workspace-name="workspaceName"
@@ -390,10 +683,13 @@ onMounted(() => {
       @delete="handleDeleteRequested"
       @refresh="refreshFileList"
       @close="isFilePanelOpen = false"
+      @search="handleSearch"
+      @toggle-directory="handleToggleDirectory"
     />
 
     <!-- Layer 1: Top Bar -->
     <TopBar
+      ref="topBarRef"
       :scene="currentScene"
       :workspace-kind="workspaceKind"
       :workspace-name="workspaceName"
@@ -428,13 +724,13 @@ onMounted(() => {
           </button>
           <button
             class="editor-save-btn"
-            :class="{ dirty: isDirty }"
-            :disabled="isSaving || isBurningCurrentFile || !isDirty"
+            :class="{ dirty: isDirty, saved: saveState === 'saved' && !isDirty }"
+            :disabled="isSaving || isBurningCurrentFile || !currentFile"
             @click="handleSave"
             title="Save (Ctrl+S)"
             aria-label="Save"
           >
-            {{ isSaving ? 'Saving...' : 'Save' }}
+            {{ isSaving ? 'Saving...' : saveState === 'saved' ? 'Saved' : 'Save' }}
           </button>
         </div>
 
@@ -470,6 +766,22 @@ onMounted(() => {
 
     <!-- Layer 4: Zen Timer (bottom-left) -->
     <ZenTimer :left-offset="isFilePanelOpen ? 246 : 20" />
+
+    <transition name="notice-fade">
+      <div
+        v-if="notice"
+        class="notice-card"
+        :class="`notice-card--${notice.tone}`"
+        role="status"
+        aria-live="polite"
+      >
+        <div class="notice-copy">
+          <span class="notice-title">{{ notice.title }}</span>
+          <p class="notice-message">{{ notice.message }}</p>
+        </div>
+        <button class="notice-close" aria-label="Dismiss notice" @click="closeNotice">×</button>
+      </div>
+    </transition>
 
     <transition name="dialog-fade">
       <div
@@ -586,6 +898,12 @@ onMounted(() => {
   border-color: color-mix(in srgb, var(--color-warning) 60%, var(--color-border-muted));
   color: var(--color-text-heading);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-warning) 14%, transparent);
+}
+
+.editor-save-btn.saved {
+  border-color: color-mix(in srgb, var(--color-accent) 48%, var(--color-border-muted));
+  color: var(--color-text-heading);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 12%, transparent);
 }
 
 .editor-save-btn:hover:not(:disabled) {
@@ -749,6 +1067,84 @@ onMounted(() => {
   opacity: 0;
 }
 
+.notice-card {
+  position: fixed;
+  top: 58px;
+  right: 18px;
+  z-index: calc(var(--z-editor) + 5);
+  width: min(320px, calc(100vw - 24px));
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 14px 12px;
+  border: 1px solid color-mix(in srgb, var(--color-border-muted) 82%, transparent);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--color-surface-solid) 94%, transparent);
+  box-shadow: var(--shadow-editor);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+.notice-card--success {
+  border-color: color-mix(in srgb, #34d399 44%, var(--color-border-muted));
+}
+
+.notice-card--error {
+  border-color: color-mix(in srgb, #fb7185 44%, var(--color-border-muted));
+}
+
+.notice-card--info {
+  border-color: color-mix(in srgb, var(--color-accent) 38%, var(--color-border-muted));
+}
+
+.notice-copy {
+  min-width: 0;
+}
+
+.notice-title {
+  display: inline-block;
+  color: var(--color-text-heading);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.notice-message {
+  margin: 6px 0 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.notice-close {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.notice-close:hover {
+  background: color-mix(in srgb, var(--topbar-btn-hover-bg) 80%, transparent);
+  color: var(--color-text-heading);
+}
+
+.notice-fade-enter-active,
+.notice-fade-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.notice-fade-enter-from,
+.notice-fade-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
 @keyframes editorEnter {
   from {
     opacity: 0;
@@ -764,6 +1160,14 @@ onMounted(() => {
   .editor-container {
     padding: 50px 12px 204px;
   }
+
+  .notice-card {
+    top: 52px;
+    right: 12px;
+    left: 12px;
+    width: auto;
+  }
+
   .editor-glass {
     border-radius: var(--radius-xl);
   }

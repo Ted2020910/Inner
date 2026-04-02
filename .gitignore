@@ -5,6 +5,9 @@ node_modules/
 dist/
 dist-ssr/
 
+# Tauri build output
+app/src-tauri/target/
+
 # Local env files
 .env
 .env.local

@@ -1,12 +1,15 @@
 {
-  "name": "app",
+  "name": "inner",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "node --import tsx server/index.ts --mode development",
-    "build": "vue-tsc -b && vite build",
-    "preview": "node --import tsx server/index.ts --mode production"
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "dev:frontend": "vite",
+    "build:frontend": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
   },
   "dependencies": {
     "@milkdown/core": "^7.20.0",
@@ -19,25 +22,20 @@
     "@milkdown/prose": "^7.20.0",
     "@milkdown/theme-nord": "^7.20.0",
     "@milkdown/transformer": "^7.20.0",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-shell": "^2",
     "@types/three": "^0.183.1",
-    "chokidar": "^5.0.0",
-    "cors": "^2.8.6",
-    "express": "^5.2.1",
     "katex": "^0.16.44",
     "three": "^0.183.2",
-    "vue": "^3.5.30",
-    "ws": "^8.20.0"
+    "vue": "^3.5.30"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2",
     "@tailwindcss/vite": "^4.2.2",
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6",
-    "@types/node": "^24.12.0",
-    "@types/ws": "^8.18.1",
     "@vitejs/plugin-vue": "^6.0.5",
     "@vue/tsconfig": "^0.9.0",
     "tailwindcss": "^4.2.2",
-    "tsx": "^4.21.0",
     "typescript": "~5.9.3",
     "vite": "^8.0.1",
     "vue-tsc": "^3.2.5"

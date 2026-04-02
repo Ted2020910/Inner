@@ -41,6 +41,20 @@ app.get('/api/files', (_req, res) => {
   }
 })
 
+app.get('/api/files/search', (req, res) => {
+  const query = typeof req.query.q === 'string' ? req.query.q.trim() : ''
+  if (!query) {
+    res.json([])
+    return
+  }
+
+  try {
+    res.json(searchMdFiles(query))
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to search files' })
+  }
+})
+
 app.get('/api/files/:name', (req, res) => {
   const filePath = safePath(req.params.name)
   if (!filePath) return res.status(400).json({ error: 'Invalid filename' })
@@ -173,6 +187,28 @@ function listMdFiles(): { name: string; lastModified: number }[] {
       const rel = path.relative(DATA_DIR, f).replace(/\\/g, '/')
       const stat = fs.statSync(f)
       return { name: rel, lastModified: stat.mtimeMs }
+    })
+    .sort((a, b) => b.lastModified - a.lastModified)
+}
+
+function searchMdFiles(query: string): { name: string; content: string; lastModified: number }[] {
+  const normalizedQuery = query.toLocaleLowerCase()
+
+  return walkDir(DATA_DIR)
+    .filter((filePath) => filePath.endsWith('.md'))
+    .map((filePath) => {
+      const content = fs.readFileSync(filePath, 'utf-8')
+      const rel = path.relative(DATA_DIR, filePath).replace(/\\/g, '/')
+      const stat = fs.statSync(filePath)
+      return {
+        name: rel,
+        content,
+        lastModified: stat.mtimeMs,
+      }
+    })
+    .filter((file) => {
+      return file.name.toLocaleLowerCase().includes(normalizedQuery)
+        || file.content.toLocaleLowerCase().includes(normalizedQuery)
     })
     .sort((a, b) => b.lastModified - a.lastModified)
 }

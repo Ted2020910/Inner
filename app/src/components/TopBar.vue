@@ -4,7 +4,7 @@ import { SCENES, type SceneId } from '../composables/useShader'
 
 const props = defineProps<{
   scene: SceneId
-  workspaceKind: 'server' | 'directory'
+  workspaceKind: 'server' | 'directory' | 'tauri'
   workspaceName: string
   supportsDirectoryPicker: boolean
   isFilePanelOpen: boolean
@@ -20,16 +20,13 @@ const emit = defineEmits<{
 const isHovered = ref(false)
 const currentIndex = computed(() => SCENES.findIndex((s) => s.id === props.scene))
 
-// Circular indexing helper
 function sceneAt(offset: number) {
   const idx = (currentIndex.value + offset + SCENES.length) % SCENES.length
   return SCENES[idx]
 }
 
-// Scroll direction for drum animation
 const slideDir = ref<1 | -1>(1)
 
-// Debounce wheel to prevent rapid fire
 let wheelLock = false
 function handleWheel(e: WheelEvent) {
   e.preventDefault()
@@ -42,6 +39,14 @@ function handleWheel(e: WheelEvent) {
   const nextIdx = (currentIndex.value + dir + SCENES.length) % SCENES.length
   emit('update:scene', SCENES[nextIdx].id)
 }
+
+function show() {
+  isHovered.value = true
+}
+
+defineExpose({
+  show,
+})
 </script>
 
 <template>
@@ -52,13 +57,12 @@ function handleWheel(e: WheelEvent) {
   >
     <transition name="fade">
       <div v-show="isHovered" class="topbar">
-        <!-- Left: file controls -->
         <div class="topbar-left">
           <button
             class="topbar-btn"
             :class="{ active: props.isFilePanelOpen }"
             @click="$emit('toggleFiles')"
-            title="Toggle file list"
+            title="Toggle file list (Ctrl/Cmd+B)"
             aria-label="Toggle file list"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -69,7 +73,6 @@ function handleWheel(e: WheelEvent) {
           </button>
           <button
             class="topbar-btn"
-            :disabled="!props.supportsDirectoryPicker"
             @click="$emit('pickFolder')"
             title="Choose folder workspace"
             aria-label="Choose folder workspace"
@@ -79,7 +82,7 @@ function handleWheel(e: WheelEvent) {
             </svg>
           </button>
           <button
-            v-if="props.workspaceKind === 'directory'"
+            v-if="props.workspaceKind !== 'server'"
             class="topbar-btn"
             @click="$emit('useServerWorkspace')"
             title="Use built-in workspace"
@@ -93,37 +96,35 @@ function handleWheel(e: WheelEvent) {
           </button>
           <div class="file-meta">
             <span class="workspace-name">
-              {{ props.workspaceKind === 'directory' ? 'Folder' : 'Built-in' }} · {{ props.workspaceName }}
+              {{ props.workspaceKind === 'server' ? 'Built-in' : 'Folder' }} / {{ props.workspaceName }}
             </span>
           </div>
         </div>
 
-        <!-- Center: drum roller scene switcher -->
-        <div
-          class="drum"
-          @wheel.prevent="handleWheel"
-          aria-label="Scene selector — scroll to switch"
-        >
-          <!-- Groove inset shadow overlay -->
-          <div class="drum-groove" />
-
-          <!-- Three visible slots: prev / current / next -->
-          <div class="drum-viewport">
-            <transition
-              :name="slideDir > 0 ? 'drum-up' : 'drum-down'"
-              mode="out-in"
-            >
-              <div class="drum-slots" :key="props.scene">
-                <span class="drum-item drum-item--far">{{ sceneAt(-1).label }}</span>
-                <span class="drum-item drum-item--center">{{ sceneAt(0).label }}</span>
-                <span class="drum-item drum-item--far">{{ sceneAt(1).label }}</span>
-              </div>
-            </transition>
-          </div>
+        <div class="topbar-center" aria-label="Brand">
+          <span class="wordmark">INEER</span>
         </div>
 
-        <!-- Right: controls -->
         <div class="topbar-right">
+          <div
+            class="drum"
+            @wheel.prevent="handleWheel"
+            aria-label="Scene selector"
+          >
+            <div class="drum-groove" />
+            <div class="drum-viewport">
+              <transition
+                :name="slideDir > 0 ? 'drum-up' : 'drum-down'"
+                mode="out-in"
+              >
+                <div class="drum-slots" :key="props.scene">
+                  <span class="drum-item drum-item--far">{{ sceneAt(-1).label }}</span>
+                  <span class="drum-item drum-item--center">{{ sceneAt(0).label }}</span>
+                  <span class="drum-item drum-item--far">{{ sceneAt(1).label }}</span>
+                </div>
+              </transition>
+            </div>
+          </div>
           <slot name="right" />
         </div>
       </div>
@@ -163,14 +164,42 @@ function handleWheel(e: WheelEvent) {
 }
 
 .topbar-left,
+.topbar-center,
 .topbar-right {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 1;
+  min-width: 0;
 }
 
-.topbar-right { justify-content: flex-end; }
+.topbar-left {
+  flex: 1 1 auto;
+}
+
+.topbar-center {
+  flex: 0 1 auto;
+  justify-content: center;
+  padding: 0 16px;
+}
+
+.topbar-right {
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.42em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text-heading) 78%, var(--color-text-muted));
+  text-shadow: var(--topbar-text-shadow);
+  white-space: nowrap;
+  opacity: 0.92;
+}
 
 .topbar-btn {
   display: flex;
@@ -217,9 +246,6 @@ function handleWheel(e: WheelEvent) {
   white-space: nowrap;
 }
 
-/* ═══════════════════════════════════
-   Drum roller — skeuomorphic picker
-   ═══════════════════════════════════ */
 .drum {
   position: relative;
   width: 160px;
@@ -227,7 +253,6 @@ function handleWheel(e: WheelEvent) {
   flex-shrink: 0;
   cursor: ns-resize;
   border-radius: var(--radius-md);
-  /* Recessed groove effect */
   background:
     linear-gradient(180deg,
       rgba(0, 0, 0, 0.25) 0%,
@@ -242,14 +267,12 @@ function handleWheel(e: WheelEvent) {
     0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
-/* Highlight band — the physical slot window */
 .drum-groove {
   position: absolute;
   inset: 0;
   z-index: 3;
   pointer-events: none;
   border-radius: var(--radius-md);
-  /* Top/bottom fade to simulate cylinder curvature */
   mask-image: linear-gradient(180deg,
     transparent 0%,
     black 25%,
@@ -306,45 +329,51 @@ function handleWheel(e: WheelEvent) {
   transform: scaleY(0.85);
 }
 
-/* ── Drum scroll transitions ── */
-
-/* Scroll down → next scene (drum rolls upward) */
 .drum-up-enter-active {
   transition: all 0.28s cubic-bezier(0.22, 1, 0.36, 1);
 }
+
 .drum-up-leave-active {
   transition: all 0.18s cubic-bezier(0.4, 0, 1, 1);
 }
+
 .drum-up-enter-from {
   opacity: 0;
   transform: translateY(14px) rotateX(-35deg);
 }
+
 .drum-up-leave-to {
   opacity: 0;
   transform: translateY(-14px) rotateX(35deg);
 }
 
-/* Scroll up → previous scene (drum rolls downward) */
 .drum-down-enter-active {
   transition: all 0.28s cubic-bezier(0.22, 1, 0.36, 1);
 }
+
 .drum-down-leave-active {
   transition: all 0.18s cubic-bezier(0.4, 0, 1, 1);
 }
+
 .drum-down-enter-from {
   opacity: 0;
   transform: translateY(-14px) rotateX(35deg);
 }
+
 .drum-down-leave-to {
   opacity: 0;
   transform: translateY(14px) rotateX(-35deg);
 }
 
-/* Fade transition for the whole topbar */
 .fade-enter-active,
-.fade-leave-active { transition: opacity var(--transition-slow); }
+.fade-leave-active {
+  transition: opacity var(--transition-slow);
+}
+
 .fade-enter-from,
-.fade-leave-to { opacity: 0; }
+.fade-leave-to {
+  opacity: 0;
+}
 
 @media (max-width: 768px) {
   .topbar {
@@ -353,8 +382,21 @@ function handleWheel(e: WheelEvent) {
     padding: 0 10px;
   }
 
+  .topbar-center {
+    padding: 0 10px;
+  }
+
+  .wordmark {
+    font-size: 10px;
+    letter-spacing: 0.28em;
+  }
+
   .drum {
     width: 120px;
+  }
+
+  .workspace-name {
+    max-width: 120px;
   }
 }
 </style>

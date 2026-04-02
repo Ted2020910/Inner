@@ -8,9 +8,13 @@ type TreeRow =
 
 const props = defineProps<{
   files: FileInfo[]
+  searchQuery: string
+  searchResults: FileInfo[]
+  isSearching: boolean
+  collapsedDirectories: string[]
   currentFileName: string | null
   workspaceName: string
-  workspaceKind: 'server' | 'directory'
+  workspaceKind: 'server' | 'directory' | 'tauri'
   visible: boolean
 }>()
 
@@ -22,36 +26,48 @@ const emit = defineEmits<{
   delete: [name: string]
   refresh: []
   close: []
+  search: [query: string]
+  toggleDirectory: [path: string]
 }>()
 
 const editingPath = ref<string | null>(null)
 const renameDraft = ref('')
 const renameInputRef = ref<HTMLInputElement | null>(null)
+const localSearch = ref(props.searchQuery)
 
 function buildTreeRows(files: FileInfo[]): TreeRow[] {
   const rows: TreeRow[] = []
   const seenDirectories = new Set<string>()
   const sortedFiles = [...files].sort((a, b) => a.name.localeCompare(b.name))
+  const collapsed = new Set(props.collapsedDirectories)
 
   for (const file of sortedFiles) {
     const segments = file.name.split('/').filter(Boolean)
+    let hiddenByCollapsedParent = false
 
     if (segments.length > 1) {
       let currentPath = ''
 
       for (let i = 0; i < segments.length - 1; i += 1) {
         currentPath = currentPath ? `${currentPath}/${segments[i]}` : segments[i]
-        if (seenDirectories.has(currentPath)) continue
 
-        seenDirectories.add(currentPath)
-        rows.push({
-          kind: 'directory',
-          path: currentPath,
-          label: segments[i],
-          depth: i,
-        })
+        if (!seenDirectories.has(currentPath)) {
+          seenDirectories.add(currentPath)
+          rows.push({
+            kind: 'directory',
+            path: currentPath,
+            label: segments[i],
+            depth: i,
+          })
+        }
+
+        if (collapsed.has(currentPath)) {
+          hiddenByCollapsedParent = true
+        }
       }
     }
+
+    if (hiddenByCollapsedParent) continue
 
     rows.push({
       kind: 'file',
@@ -65,7 +81,13 @@ function buildTreeRows(files: FileInfo[]): TreeRow[] {
   return rows
 }
 
-const rows = computed(() => buildTreeRows(props.files))
+const visibleFiles = computed(() => {
+  if (!props.searchQuery.trim()) return props.files
+  return props.searchResults
+})
+
+const rows = computed(() => buildTreeRows(visibleFiles.value))
+const collapsedSet = computed(() => new Set(props.collapsedDirectories))
 
 async function beginRename(path: string) {
   const segments = path.split('/')
@@ -99,6 +121,14 @@ function commitRename(path: string) {
 watch(() => props.visible, (visible) => {
   if (!visible) cancelRename()
 })
+
+watch(() => props.searchQuery, (value) => {
+  localSearch.value = value
+})
+
+watch(localSearch, (value) => {
+  emit('search', value)
+})
 </script>
 
 <template>
@@ -106,35 +136,53 @@ watch(() => props.visible, (visible) => {
     <aside v-if="props.visible" class="file-sidebar">
       <div class="sidebar-header">
         <div class="sidebar-copy">
-          <span class="sidebar-title">文件</span>
+          <span class="sidebar-title">Files</span>
           <span class="sidebar-subtitle">
-            {{ props.workspaceKind === 'directory' ? '文件夹' : '内置工作区' }} · {{ props.workspaceName }}
+            {{ props.workspaceKind === 'server' ? 'Built-in' : 'Folder' }} / {{ props.workspaceName }}
           </span>
         </div>
 
         <div class="sidebar-actions">
-          <button class="sidebar-btn" title="Refresh" aria-label="Refresh" @click="$emit('refresh')">↻</button>
-          <button class="sidebar-btn" title="Close" aria-label="Close" @click="$emit('close')">×</button>
+          <button class="sidebar-btn" title="Refresh" aria-label="Refresh" @click="$emit('refresh')">R</button>
+          <button class="sidebar-btn" title="Close" aria-label="Close" @click="$emit('close')">X</button>
         </div>
       </div>
 
       <div class="sidebar-create-row">
-        <button class="create-btn create-btn-journal" @click="$emit('newJournal')">新建日记</button>
-        <button class="create-btn create-btn-untitled" @click="$emit('newUntitled')">新建文件</button>
+        <button class="create-btn create-btn-journal" @click="$emit('newJournal')">New Journal</button>
+        <button class="create-btn create-btn-untitled" @click="$emit('newUntitled')">New File</button>
+      </div>
+
+      <div class="sidebar-search">
+        <input
+          v-model="localSearch"
+          class="sidebar-search-input"
+          type="text"
+          placeholder="Search files or content"
+          aria-label="Search files or content"
+        >
+        <span v-if="props.isSearching" class="sidebar-search-state">Searching...</span>
+        <span v-else-if="props.searchQuery.trim()" class="sidebar-search-state">
+          {{ props.searchResults.length }} match<span v-if="props.searchResults.length !== 1">es</span>
+        </span>
       </div>
 
       <div class="sidebar-tree">
-        <div v-if="rows.length === 0" class="sidebar-empty">暂无 Markdown 文件</div>
+        <div v-if="rows.length === 0" class="sidebar-empty">
+          {{ props.searchQuery.trim() ? 'No matching Markdown files' : 'No Markdown files yet' }}
+        </div>
 
         <template v-for="row in rows" :key="`${row.kind}:${row.path}`">
-          <div
+          <button
             v-if="row.kind === 'directory'"
-            class="tree-row directory"
+            class="tree-row directory directory-btn"
+            :class="{ collapsed: collapsedSet.has(row.path) }"
             :style="{ '--depth': row.depth }"
+            @click="$emit('toggleDirectory', row.path)"
           >
-            <span class="tree-icon">▾</span>
+            <span class="tree-caret">{{ collapsedSet.has(row.path) ? '>' : 'v' }}</span>
             <span class="tree-label">{{ row.label }}</span>
-          </div>
+          </button>
 
           <div
             v-else-if="editingPath === row.path"
@@ -142,7 +190,7 @@ watch(() => props.visible, (visible) => {
             :style="{ '--depth': row.depth }"
           >
             <span class="tree-main">
-              <span class="tree-icon">•</span>
+              <span class="tree-icon">-</span>
               <input
                 ref="renameInputRef"
                 v-model="renameDraft"
@@ -163,11 +211,11 @@ watch(() => props.visible, (visible) => {
             @dblclick.stop="beginRename(row.path)"
           >
             <span class="tree-main">
-              <span class="tree-icon">•</span>
+              <span class="tree-icon">-</span>
               <span class="tree-label">{{ row.label }}</span>
             </span>
             <span class="tree-actions">
-              <span class="tree-action-btn danger" title="Delete" @click.stop="$emit('delete', row.path)">×</span>
+              <span class="tree-action-btn danger" title="Delete" @click.stop="$emit('delete', row.path)">X</span>
             </span>
           </button>
         </template>
@@ -251,14 +299,6 @@ watch(() => props.visible, (visible) => {
   font-size: 11px;
 }
 
-.sidebar-tree {
-  min-height: 0;
-  overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
 .sidebar-create-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -286,8 +326,45 @@ watch(() => props.visible, (visible) => {
   border-color: color-mix(in srgb, var(--color-warning) 38%, var(--color-border-muted));
 }
 
-.create-btn:hover {
+.create-btn:hover,
+.sidebar-btn:hover {
   background: color-mix(in srgb, var(--topbar-btn-hover-bg) 80%, transparent);
+}
+
+.sidebar-search {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sidebar-search-input {
+  width: 100%;
+  min-height: 32px;
+  border: 1px solid color-mix(in srgb, var(--color-border-muted) 82%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-surface-solid) 92%, transparent);
+  color: var(--color-text-primary);
+  padding: 0 10px;
+  font-size: 12px;
+  outline: none;
+}
+
+.sidebar-search-input::placeholder {
+  color: color-mix(in srgb, var(--color-text-secondary) 78%, transparent);
+}
+
+.sidebar-search-state {
+  color: color-mix(in srgb, var(--color-text-secondary) 88%, white 12%);
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.sidebar-tree {
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .sidebar-empty {
@@ -304,12 +381,36 @@ watch(() => props.visible, (visible) => {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-height: 22px;
+  min-height: 24px;
   padding: 0 6px 0 calc(6px + var(--row-indent));
   color: color-mix(in srgb, var(--color-text-secondary) 88%, white 12%);
   font-size: 10px;
   letter-spacing: 0.04em;
   font-weight: 600;
+}
+
+.directory-btn {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.directory-btn:hover {
+  background: color-mix(in srgb, var(--topbar-btn-hover-bg) 70%, transparent);
+}
+
+.tree-caret {
+  width: 10px;
+  flex: none;
+  color: color-mix(in srgb, var(--color-text-secondary) 82%, white 18%);
+  font-size: 9px;
+}
+
+.directory-btn.collapsed .tree-caret {
+  transform: translateX(1px);
 }
 
 .tree-row.file {
