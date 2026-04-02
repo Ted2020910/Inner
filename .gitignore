@@ -38,6 +38,12 @@ pnpm-debug.log*
 # OS
 Thumbs.db
 
+# Large media files
+*.mp4
+*.mov
+*.avi
+*.mkv
+
 # AI agent
 .claude/
 reference shadertoy/
