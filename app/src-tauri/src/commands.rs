@@ -4,7 +4,7 @@ use std::time::UNIX_EPOCH;
 use std::{fs, io};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 // ── 共享状态 ──────────────────────────────────────────────────────────────────
 
