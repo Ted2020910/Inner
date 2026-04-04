@@ -21,11 +21,13 @@ import 'katex/dist/katex.min.css'
 // ── KaTeX Widget ─────────────────────────────────────────────────────────────
 
 class MathWidget extends WidgetType {
-  constructor(
-    private readonly latex: string,
-    private readonly block: boolean,
-  ) {
+  private readonly latex: string
+  private readonly block: boolean
+
+  constructor(latex: string, block: boolean) {
     super()
+    this.latex = latex
+    this.block = block
   }
 
   eq(other: MathWidget) {

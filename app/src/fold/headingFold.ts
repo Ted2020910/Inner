@@ -1,6 +1,7 @@
 import { foldService, foldGutter } from '@codemirror/language'
 import { syntaxTree } from '@codemirror/language'
 import type { EditorState } from '@codemirror/state'
+import type { SyntaxNode } from '@lezer/common'
 
 // Node names for ATX headings in @lezer/markdown
 const HEADING_NODES = new Set([
@@ -16,16 +17,16 @@ export const headingFoldService = foldService.of((state: EditorState, lineStart:
   const tree = syntaxTree(state)
 
   // Find if there is a heading node that starts on this line
-  let headingNode: ReturnType<typeof tree.resolve> | null = null
+  let headingNode: SyntaxNode | null = null
   let headingLevel = 0
 
   tree.iterate({
     from: lineStart,
     to: lineEnd,
-    enter(node) {
-      if (HEADING_NODES.has(node.name)) {
-        headingNode = node
-        headingLevel = parseInt(node.name.replace('ATXHeading', ''), 10)
+    enter(nodeRef) {
+      if (HEADING_NODES.has(nodeRef.name)) {
+        headingNode = nodeRef.node
+        headingLevel = parseInt(nodeRef.name.replace('ATXHeading', ''), 10)
         return false // stop
       }
     },

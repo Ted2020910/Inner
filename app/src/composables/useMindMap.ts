@@ -278,12 +278,11 @@ export function useMindMap() {
 
     // ── Hover interactions (no transition delay) ──
     all.on('mouseenter', function (this: SVGGElement) {
+      const d = (this as any).__mmdata__ as LayoutNode | undefined
+      const isRoot = d?.depth === 0
       d3Selection.select(this).select('rect.mm-card')
         .attr('stroke-opacity', 0.9)
-        .attr('stroke-width', function () {
-          const d = (this as any).__data__ || (this.parentNode as any).__mmdata__
-          return d?.depth === 0 ? 2.5 : 1.8
-        })
+        .attr('stroke-width', isRoot ? 2.5 : 1.8)
     })
     all.on('mouseleave', function (this: SVGGElement) {
       const d = (this as any).__mmdata__ as LayoutNode | undefined
