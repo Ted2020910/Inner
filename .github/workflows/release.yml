@@ -17,10 +17,16 @@ jobs:
         include:
           - platform: windows-latest
             args: '--target x86_64-pc-windows-msvc'
-          - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
+            rust-target: 'x86_64-pc-windows-msvc'
           - platform: macos-latest
             args: '--target aarch64-apple-darwin'
+            rust-target: 'aarch64-apple-darwin'
+          - platform: macos-13
+            args: '--target x86_64-apple-darwin'
+            rust-target: 'x86_64-apple-darwin'
+          - platform: ubuntu-22.04
+            args: ''
+            rust-target: ''
 
     runs-on: ${{ matrix.platform }}
 
@@ -35,10 +41,16 @@ jobs:
           cache: 'npm'
           cache-dependency-path: app/package-lock.json
 
+      - name: Install system dependencies (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.args == '--target aarch64-apple-darwin' && 'aarch64-apple-darwin' || matrix.args == '--target x86_64-apple-darwin' && 'x86_64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
+          targets: ${{ matrix.rust-target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -55,14 +67,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: app
+          tauriScript: npx tauri
           args: ${{ matrix.args }}
           tagName: ${{ github.ref_name }}
           releaseName: 'Inner ${{ github.ref_name }}'
           releaseBody: |
-            ## 下载
+            ## Inner ${{ github.ref_name }}
 
-            - **Windows**：下载 `Inner_x.x.x_x64-setup.exe`
-            - **macOS (Apple Silicon)**：下载 `Inner_x.x.x_aarch64.dmg`
-            - **macOS (Intel)**：下载 `Inner_x.x.x_x64.dmg`
+            ### Downloads
+            - **Windows**: `Inner_x.x.x_x64-setup.exe` or `.msi`
+            - **macOS (Apple Silicon)**: `Inner_x.x.x_aarch64.dmg`
+            - **macOS (Intel)**: `Inner_x.x.x_x64.dmg`
+            - **Linux**: `.deb` / `.AppImage`
           releaseDraft: false
           prerelease: false
