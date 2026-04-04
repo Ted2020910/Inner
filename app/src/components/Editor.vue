@@ -1,40 +1,182 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
-import { Editor, rootCtx, defaultValueCtx, editorViewCtx, serializerCtx } from '@milkdown/core'
-import { commonmark } from '@milkdown/preset-commonmark'
-import { gfm } from '@milkdown/preset-gfm'
-import { nord } from '@milkdown/theme-nord'
-import type { Ctx } from '@milkdown/ctx'
-import { listener, listenerCtx } from '@milkdown/plugin-listener'
-import { math } from '@milkdown/plugin-math'
-import '@milkdown/theme-nord/style.css'
-import 'katex/dist/katex.min.css'
+import { ref, shallowRef, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { EditorState, Annotation, type ChangeSpec } from '@codemirror/state'
+import { EditorView, keymap, lineNumbers } from '@codemirror/view'
+import { defaultKeymap, historyKeymap, history } from '@codemirror/commands'
+import { syntaxHighlighting, foldKeymap } from '@codemirror/language'
+import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
+import { languages } from '@codemirror/language-data'
+import { nordTheme } from '../theme/nordTheme'
+import { mdHighlight } from '../theme/mdHighlight'
+import { headingFoldService, headingFoldGutter } from '../fold/headingFold'
+import { useToc, extractHeadings } from '../composables/useToc'
+import { markdownDecorations, markdownAtomicRanges } from '../extensions/markdownDecorations'
+import { mathDecorations, mathTheme } from '../extensions/mathDecorations'
 
 const emit = defineEmits<{
   dirty: []
+  'toc-update': [entries: ReturnType<typeof useToc>['entries']['value']]
 }>()
 
 const editorRef = ref<HTMLDivElement | null>(null)
-let editorInstance: Editor | null = null
-let editorReady = false
-let suppressDirtyEvent = false
+const view = shallowRef<EditorView | null>(null)
+
+const isProgrammaticAnnotation = Annotation.define<boolean>()
+
 let pendingContent = ''
 let burnOverlay: HTMLDivElement | null = null
 let fadeInTimer = 0
 const MIN_BURN_PARTICLES = 72
 const MAX_BURN_PARTICLES = 320
 
-type BurnRect = {
-  left: number
-  top: number
-  width: number
-  height: number
-  color: string
+const { entries: tocEntries, update: updateToc } = useToc()
+
+// ── TOC exposed for parent ──────────────────────────────────────────────────
+defineExpose({
+  getMarkdown,
+  setMarkdown,
+  burnAndClear,
+  transitionTo,
+  tocEntries,
+  scrollToPos,
+  replaceHeadingText,
+  insertHeading,
+  deleteHeading,
+})
+
+// ── Heading editing API (for MindMap bidirectional sync) ─────────────────────
+
+/**
+ * Replace the heading text at the given document position.
+ * Preserves the `#` prefix and only replaces the text portion.
+ */
+function replaceHeadingText(pos: number, newText: string) {
+  if (!view.value) return
+
+  const state = view.value.state
+  const line = state.doc.lineAt(pos)
+  const lineText = line.text
+  const match = lineText.match(/^(#{1,6}\s+)/)
+  if (!match) return
+
+  const prefix = match[1] // e.g. "## "
+  const newLineText = prefix + newText
+  const changes: ChangeSpec = {
+    from: line.from,
+    to: line.to,
+    insert: newLineText,
+  }
+
+  view.value.dispatch({
+    changes,
+    annotations: isProgrammaticAnnotation.of(true),
+  })
+
+  // Manually trigger dirty + toc update since we suppress programmatic annotation
+  emit('dirty')
+  updateToc(view.value.state)
+  emit('toc-update', tocEntries.value)
 }
+
+/**
+ * Insert a new heading after the section that starts at `afterPos`.
+ * The new heading is placed just before the next heading of the same or higher level.
+ */
+function insertHeading(afterPos: number, level: number, text: string) {
+  if (!view.value) return
+
+  const state = view.value.state
+  const headings = extractCurrentHeadings()
+  const afterIdx = headings.findIndex((h) => h.pos === afterPos)
+  const afterHeading = headings[afterIdx]
+  if (!afterHeading) return
+
+  // Find the end of the section: look for the next heading of same or higher level
+  let insertAt = state.doc.length
+  for (let i = afterIdx + 1; i < headings.length; i++) {
+    if (headings[i].level <= afterHeading.level) {
+      // Insert before this heading's line
+      const line = state.doc.lineAt(headings[i].pos)
+      insertAt = line.from
+      break
+    }
+  }
+
+  const prefix = '#'.repeat(level)
+  const insertion = `\n${prefix} ${text}\n`
+
+  const changes: ChangeSpec = {
+    from: insertAt,
+    to: insertAt,
+    insert: insertion,
+  }
+
+  view.value.dispatch({
+    changes,
+    annotations: isProgrammaticAnnotation.of(true),
+  })
+
+  emit('dirty')
+  updateToc(view.value.state)
+  emit('toc-update', tocEntries.value)
+}
+
+/**
+ * Delete the heading at the given position along with its entire section content
+ * (up to the next heading of the same or higher level).
+ */
+function deleteHeading(pos: number) {
+  if (!view.value) return
+
+  const state = view.value.state
+  const headings = extractCurrentHeadings()
+  const headingIdx = headings.findIndex((h) => h.pos === pos)
+  if (headingIdx === -1) return
+
+  const heading = headings[headingIdx]
+  const startLine = state.doc.lineAt(heading.pos)
+
+  // Find the end of the section
+  let deleteEnd = state.doc.length
+  for (let i = headingIdx + 1; i < headings.length; i++) {
+    if (headings[i].level <= heading.level) {
+      const line = state.doc.lineAt(headings[i].pos)
+      deleteEnd = line.from
+      break
+    }
+  }
+
+  const changes: ChangeSpec = {
+    from: startLine.from,
+    to: deleteEnd,
+    insert: '',
+  }
+
+  view.value.dispatch({
+    changes,
+    annotations: isProgrammaticAnnotation.of(true),
+  })
+
+  emit('dirty')
+  updateToc(view.value.state)
+  emit('toc-update', tocEntries.value)
+}
+
+/**
+ * Extract current headings from the editor state (used internally by edit helpers).
+ */
+function extractCurrentHeadings(): Array<{ level: number; text: string; pos: number }> {
+  if (!view.value) return []
+  return extractHeadings(view.value.state)
+}
+
+// ── Burn helpers (ported from Milkdown version) ─────────────────────────────
+
+type BurnRect = { left: number; top: number; width: number; height: number; color: string }
 
 function cleanupBurnOverlay() {
   editorRef.value
-    ?.querySelector('.ProseMirror.is-burning-source')
+    ?.querySelector('.cm-content.is-burning-source')
     ?.classList.remove('is-burning-source')
 
   if (burnOverlay) {
@@ -45,10 +187,8 @@ function cleanupBurnOverlay() {
 
 function triggerContentFadeIn() {
   if (!editorRef.value) return
-
   window.clearTimeout(fadeInTimer)
   editorRef.value.classList.remove('content-fade-in')
-
   requestAnimationFrame(() => {
     editorRef.value?.classList.add('content-fade-in')
     fadeInTimer = window.setTimeout(() => {
@@ -58,9 +198,7 @@ function triggerContentFadeIn() {
 }
 
 function wait(ms: number) {
-  return new Promise<void>((resolve) => {
-    window.setTimeout(resolve, ms)
-  })
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms))
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -72,12 +210,7 @@ function createBurnSnapshot(source: HTMLElement, ...classNames: string[]) {
   clone.classList.add(...classNames)
   clone.removeAttribute('contenteditable')
   clone.removeAttribute('spellcheck')
-  clone.querySelectorAll('[contenteditable]').forEach((node) => {
-    node.removeAttribute('contenteditable')
-  })
-  clone.querySelectorAll('.ProseMirror-trailingBreak').forEach((node) => {
-    node.remove()
-  })
+  clone.querySelectorAll('[contenteditable]').forEach((n) => n.removeAttribute('contenteditable'))
   return clone
 }
 
@@ -85,9 +218,7 @@ function collectBurnRects(source: HTMLElement): BurnRect[] {
   const sourceBounds = source.getBoundingClientRect()
   const walker = document.createTreeWalker(source, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
-      return node.textContent?.trim()
-        ? NodeFilter.FILTER_ACCEPT
-        : NodeFilter.FILTER_REJECT
+      return node.textContent?.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
     },
   })
   const rects: BurnRect[] = []
@@ -96,17 +227,12 @@ function collectBurnRects(source: HTMLElement): BurnRect[] {
   while (currentNode) {
     const textNode = currentNode as Text
     const parent = textNode.parentElement
-
     if (parent) {
       const color = window.getComputedStyle(parent).color || 'rgba(226, 232, 240, 0.7)'
       const range = document.createRange()
       range.selectNodeContents(textNode)
-
       Array.from(range.getClientRects()).forEach((rect) => {
-        if (rect.width < 2 || rect.height < 2) {
-          return
-        }
-
+        if (rect.width < 2 || rect.height < 2) return
         rects.push({
           left: rect.left - sourceBounds.left,
           top: rect.top - sourceBounds.top,
@@ -116,7 +242,6 @@ function collectBurnRects(source: HTMLElement): BurnRect[] {
         })
       })
     }
-
     currentNode = walker.nextNode()
   }
 
@@ -128,30 +253,23 @@ function createSmokeParticles(source: HTMLElement, originX: number, originY: num
   layer.className = 'burn-particles'
 
   const rects = collectBurnRects(source)
-  if (!rects.length) {
-    return layer
-  }
+  if (!rects.length) return layer
 
-  const weights = rects.map((rect) => Math.max(1, rect.width * rect.height))
-  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0)
+  const weights = rects.map((r) => Math.max(1, r.width * r.height))
+  const totalWeight = weights.reduce((s, w) => s + w, 0)
   const particleBudget = clamp(Math.round(totalWeight / 150), MIN_BURN_PARTICLES, MAX_BURN_PARTICLES)
   const cumulativeWeights: number[] = []
-
-  weights.reduce((sum, weight, index) => {
-    const next = sum + weight
-    cumulativeWeights[index] = next
+  weights.reduce((sum, w, i) => {
+    const next = sum + w
+    cumulativeWeights[i] = next
     return next
   }, 0)
 
   for (let i = 0; i < particleBudget; i++) {
     const target = Math.random() * totalWeight
     let rect = rects[rects.length - 1]
-
-    for (let index = 0; index < cumulativeWeights.length; index++) {
-      if (cumulativeWeights[index] >= target) {
-        rect = rects[index]
-        break
-      }
+    for (let j = 0; j < cumulativeWeights.length; j++) {
+      if (cumulativeWeights[j] >= target) { rect = rects[j]; break }
     }
 
     const particle = document.createElement('span')
@@ -197,29 +315,74 @@ function createSmokeParticles(source: HTMLElement, originX: number, originY: num
   return layer
 }
 
-async function createEditor(initialContent: string) {
-  if (!editorRef.value) return
+// ── Editor lifecycle ────────────────────────────────────────────────────────
 
-  editorInstance = await Editor.make()
-    .use(listener)
-    .config((ctx) => {
-      ctx.set(rootCtx, editorRef.value!)
-      ctx.set(defaultValueCtx, initialContent)
-      ctx.get(listenerCtx).updated(handleDocumentUpdated)
-    })
-    .config(nord)
-    .use(commonmark)
-    .use(gfm)
-    .use(math)
-    .create()
-
-  editorReady = true
+function buildExtensions() {
+  return [
+    nordTheme,
+    syntaxHighlighting(mdHighlight),
+    markdown({ base: markdownLanguage, codeLanguages: languages }),
+    history(),
+    lineNumbers(),
+    headingFoldGutter,
+    headingFoldService,
+    markdownDecorations,
+    markdownAtomicRanges,
+    mathDecorations,
+    mathTheme,
+    keymap.of([...defaultKeymap, ...historyKeymap, ...foldKeymap]),
+    EditorView.updateListener.of((update) => {
+      if (update.docChanged) {
+        // Only emit dirty if this was NOT a programmatic set
+        const isProgrammatic = update.transactions.some((tr) =>
+          tr.annotation(isProgrammaticAnnotation) === true,
+        )
+        if (!isProgrammatic) {
+          emit('dirty')
+        }
+        updateToc(update.state)
+        emit('toc-update', tocEntries.value)
+      }
+    }),
+  ]
 }
 
-function handleDocumentUpdated(_ctx: Ctx) {
-  if (!suppressDirtyEvent) {
-    emit('dirty')
-  }
+function createView(content: string) {
+  if (!editorRef.value) return
+
+  const state = EditorState.create({
+    doc: content,
+    extensions: buildExtensions(),
+  })
+
+  view.value = new EditorView({
+    state,
+    parent: editorRef.value,
+  })
+
+  // Initial TOC
+  updateToc(state)
+  emit('toc-update', tocEntries.value)
+}
+
+function destroyView() {
+  view.value?.destroy()
+  view.value = null
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+function getMarkdown(): string {
+  if (!view.value) return pendingContent
+  return view.value.state.doc.toString()
+}
+
+function scrollToPos(pos: number) {
+  if (!view.value) return
+  view.value.dispatch({
+    effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 60 }),
+  })
+  view.value.focus()
 }
 
 async function setMarkdown(content: string) {
@@ -227,69 +390,35 @@ async function setMarkdown(content: string) {
 
   if (!editorRef.value) return
 
-  suppressDirtyEvent = true
-
-  try {
-    if (editorInstance) {
-      await editorInstance.destroy()
-      editorInstance = null
-      editorReady = false
-    }
-
-    editorRef.value.innerHTML = ''
-    cleanupBurnOverlay()
-    await nextTick()
-    await createEditor(content)
-    triggerContentFadeIn()
-  } finally {
-    suppressDirtyEvent = false
-  }
+  destroyView()
+  editorRef.value.innerHTML = ''
+  cleanupBurnOverlay()
+  await nextTick()
+  createView(content)
+  triggerContentFadeIn()
 }
 
-function getMarkdown() {
-  if (!editorInstance || !editorReady) {
-    return pendingContent
-  }
-
-  return editorInstance.action((ctx) => {
-    const serializer = ctx.get(serializerCtx)
-    const view = ctx.get(editorViewCtx)
-    return serializer(view.state.doc)
-  })
-}
-
-/**
- * Burn-after-writing: sample the visible text areas, emit soft particles
- * directly from those glyph regions, then let the snapshot blur away.
- */
-async function playBurnAnimation() {
-  if (!editorRef.value) {
-    return false
-  }
+async function playBurnAnimation(): Promise<boolean> {
+  if (!editorRef.value) return false
 
   cleanupBurnOverlay()
 
-  const proseMirror = editorRef.value.querySelector('.ProseMirror') as HTMLElement | null
-  if (!proseMirror) {
-    return false
-  }
-
-  if (!proseMirror.textContent?.trim()) {
-    return false
-  }
+  const cmContent = editorRef.value.querySelector('.cm-content') as HTMLElement | null
+  if (!cmContent) return false
+  if (!cmContent.textContent?.trim()) return false
 
   const editorBounds = editorRef.value.getBoundingClientRect()
-  const sourceBounds = proseMirror.getBoundingClientRect()
+  const sourceBounds = cmContent.getBoundingClientRect()
   const originX = sourceBounds.left - editorBounds.left
   const originY = sourceBounds.top - editorBounds.top
-  const contentH = Math.max(proseMirror.scrollHeight, proseMirror.offsetHeight)
+  const contentH = Math.max(cmContent.scrollHeight, cmContent.offsetHeight)
 
   const overlay = document.createElement('div')
   overlay.className = 'burn-overlay'
   overlay.style.height = `${Math.ceil(originY + contentH + 24)}px`
   burnOverlay = overlay
 
-  const snapshot = createBurnSnapshot(proseMirror, 'burn-base')
+  const snapshot = createBurnSnapshot(cmContent, 'burn-base')
   snapshot.style.cssText = [
     `left:${originX.toFixed(2)}px`,
     `top:${originY.toFixed(2)}px`,
@@ -297,22 +426,22 @@ async function playBurnAnimation() {
     `min-height:${contentH}px`,
   ].join(';')
 
-  const ash = createBurnSnapshot(proseMirror, 'burn-ash')
+  const ash = createBurnSnapshot(cmContent, 'burn-ash')
   ash.style.cssText = snapshot.style.cssText
 
   overlay.appendChild(snapshot)
   overlay.appendChild(ash)
-  overlay.appendChild(createSmokeParticles(proseMirror, originX, originY))
+  overlay.appendChild(createSmokeParticles(cmContent, originX, originY))
 
-  proseMirror.classList.add('is-burning-source')
+  cmContent.classList.add('is-burning-source')
   editorRef.value.appendChild(overlay)
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve) =>
     requestAnimationFrame(() => {
       overlay.classList.add('is-burning')
       resolve()
-    })
-  })
+    }),
+  )
 
   await wait(1600)
   return true
@@ -320,43 +449,31 @@ async function playBurnAnimation() {
 
 async function burnAndClear(): Promise<void> {
   const didBurn = await playBurnAnimation()
-  if (!didBurn) {
-    await setMarkdown('')
-    return
-  }
   await setMarkdown('')
+  void didBurn
 }
 
 async function transitionTo(content: string): Promise<void> {
   const didBurn = await playBurnAnimation()
-  if (!didBurn) {
-    await setMarkdown(content)
-    return
-  }
-
   await setMarkdown(content)
+  void didBurn
 }
 
-defineExpose({
-  getMarkdown,
-  setMarkdown,
-  burnAndClear,
-  transitionTo,
-})
+// ── Mount ───────────────────────────────────────────────────────────────────
 
-onMounted(async () => {
-  await createEditor(pendingContent)
+onMounted(() => {
+  createView(pendingContent)
 })
 
 onBeforeUnmount(() => {
   window.clearTimeout(fadeInTimer)
-  void editorInstance?.destroy()
+  destroyView()
 })
 </script>
 
 <template>
   <div class="editor-wrapper">
-    <div ref="editorRef" class="milkdown-editor" />
+    <div ref="editorRef" class="cm-editor-host" />
   </div>
 </template>
 
@@ -368,218 +485,37 @@ onBeforeUnmount(() => {
   overflow-y: auto;
 }
 
-.milkdown-editor {
+.cm-editor-host {
   position: relative;
   min-height: 100%;
   outline: none;
 }
 
-.milkdown-editor.content-fade-in {
+.cm-editor-host.content-fade-in {
   animation: editorContentFade 240ms cubic-bezier(0.2, 0.72, 0.2, 1);
 }
 
-.milkdown-editor :deep(.milkdown) {
-  padding: 1.5rem 2rem;
-  color: var(--color-text-primary, #e2e8f0);
-  font-size: 1rem;
+/* Let CodeMirror fill the wrapper */
+.cm-editor-host :deep(.cm-editor) {
+  height: 100%;
+  background: transparent !important;
+}
+
+.cm-editor-host :deep(.cm-scroller) {
+  font-family: var(--editor-font-family, inherit);
+  font-size: var(--editor-font-size, 15px);
   line-height: 1.8;
-  background: transparent !important;
+  padding: 1.5rem 2rem;
+  overflow: visible;
 }
 
-.milkdown-editor :deep(.editor) {
-  padding: 0;
-  background: transparent !important;
-  color: var(--color-text-primary, #e2e8f0);
-}
-
-.milkdown-editor :deep(.ProseMirror) {
-  outline: none;
+.cm-editor-host :deep(.cm-content) {
   min-height: 60vh;
-  padding: 1rem;
-  background: transparent !important;
-}
-
-.milkdown-editor :deep(h1) {
-  color: var(--color-text-heading, #f1f5f9);
-  font-weight: 300;
-  font-size: 2.2rem;
-  letter-spacing: -0.02em;
-  border-bottom: 1px solid var(--color-border-hover, rgba(148, 163, 184, 0.15));
-  padding-bottom: 0.5rem;
-  margin-bottom: 1.5rem;
-}
-
-.milkdown-editor :deep(h2) {
-  color: var(--color-text-primary, #e2e8f0);
-  font-weight: 400;
-  font-size: 1.6rem;
-  margin-top: 2rem;
-}
-
-.milkdown-editor :deep(h3) {
-  color: var(--color-text-primary, #cbd5e1);
-  font-weight: 500;
-  font-size: 1.25rem;
-}
-
-.milkdown-editor :deep(p) {
-  color: var(--color-text-primary, #cbd5e1);
-  margin: 0.8rem 0;
-}
-
-.milkdown-editor :deep(a) {
-  color: var(--color-accent, #7dd3fc);
-  text-decoration: none;
-  border-bottom: 1px solid var(--editor-link-border);
-  transition: border-color 0.2s;
-}
-
-.milkdown-editor :deep(a:hover) {
-  border-bottom-color: var(--color-accent);
-}
-
-.milkdown-editor :deep(code) {
-  background: var(--color-code-bg, rgba(30, 41, 59, 0.6));
-  color: var(--color-code, #a5f3fc);
-  padding: 0.15em 0.4em;
-  border-radius: 4px;
-  font-size: 0.9em;
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
-}
-
-.milkdown-editor :deep(pre) {
-  background: var(--color-pre-bg, rgba(15, 23, 42, 0.6));
-  border: 1px solid var(--color-pre-border, rgba(51, 65, 85, 0.4));
-  border-radius: 8px;
-  padding: 1rem 1.2rem;
-  overflow-x: auto;
-}
-
-.milkdown-editor :deep(pre code) {
-  background: none;
-  padding: 0;
-  color: var(--editor-precode-color);
-}
-
-.milkdown-editor :deep(blockquote) {
-  border-left: 3px solid var(--editor-blockquote-border);
-  padding-left: 1rem;
-  margin-left: 0;
-  color: var(--color-text-secondary);
-  font-style: italic;
-}
-
-.milkdown-editor :deep(ul),
-.milkdown-editor :deep(ol) {
-  padding-left: 1.5rem;
-  color: var(--editor-list-color);
-}
-
-.milkdown-editor :deep(li) {
-  margin: 0.3rem 0;
-}
-
-.milkdown-editor :deep(li::marker) {
-  color: var(--editor-marker-color);
-}
-
-.milkdown-editor :deep(hr) {
-  border: none;
-  border-top: 1px solid var(--editor-hr-color);
-  margin: 2rem 0;
-}
-
-.milkdown-editor :deep(strong) {
-  color: var(--editor-strong-color);
-  font-weight: 600;
-}
-
-.milkdown-editor :deep(em) {
-  color: var(--color-emphasis);
-}
-
-.milkdown-editor :deep(table) {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 1rem 0;
-  background: transparent !important;
-}
-
-.milkdown-editor :deep(thead),
-.milkdown-editor :deep(tbody),
-.milkdown-editor :deep(tr) {
-  background: transparent !important;
-}
-
-.milkdown-editor :deep(tr:hover) {
-  background: var(--editor-tr-hover) !important;
-}
-
-.milkdown-editor :deep(th) {
-  background: var(--editor-th-bg) !important;
-  color: var(--color-text-primary);
-  font-weight: 500;
-  padding: 0.5rem 0.75rem;
-  text-align: left;
-  border: 1px solid var(--editor-th-border);
-}
-
-.milkdown-editor :deep(td) {
-  background: transparent !important;
-  color: var(--editor-list-color);
-  padding: 0.5rem 0.75rem;
-  text-align: left;
-  border: 1px solid var(--editor-td-border);
-}
-
-.milkdown-editor :deep(.tableWrapper),
-.milkdown-editor :deep([class*="table"]) {
-  background: transparent !important;
-}
-
-.milkdown-editor :deep(.math-inline),
-.milkdown-editor :deep(.math-block),
-.milkdown-editor :deep(.katex-display),
-.milkdown-editor :deep(.katex) {
-  color: var(--color-code);
-  background: transparent !important;
-}
-
-.milkdown-editor :deep(.katex-html) {
-  color: var(--color-accent);
-}
-
-.milkdown-editor :deep(.math-block) {
-  padding: 0.75rem 0;
-  overflow-x: auto;
-}
-
-.milkdown-editor :deep([data-type="math_inline"]),
-.milkdown-editor :deep([data-type="math_block"]) {
-  background: var(--editor-math-bg) !important;
-  border-radius: 4px;
-  padding: 0 4px;
-}
-
-.milkdown-editor :deep(input[type='checkbox']) {
-  accent-color: var(--color-accent);
-  margin-right: 0.5rem;
-}
-
-.milkdown-editor :deep(::selection) {
-  background: var(--editor-selection-bg);
-}
-
-.milkdown-editor :deep(.ProseMirror p.is-editor-empty:first-child::before) {
-  content: 'Start writing...';
-  color: var(--color-text-muted);
-  float: left;
-  pointer-events: none;
-  height: 0;
+  caret-color: var(--color-accent, #88c0d0);
 }
 
 /* ── Burn — text turns into smoke in place ── */
-.milkdown-editor :deep(.ProseMirror.is-burning-source) {
+.cm-editor-host :deep(.cm-content.is-burning-source) {
   opacity: 0;
 }
 

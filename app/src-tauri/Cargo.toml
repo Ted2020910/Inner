@@ -1,6 +1,6 @@
 [package]
 name = "inner"
-version = "0.1.0"
+version = "0.2.0"
 description = "Inner — 一个让你安静下来写字的地方"
 authors = []
 edition = "2021"

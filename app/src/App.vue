@@ -14,6 +14,8 @@ const VibeMixer = defineAsyncComponent(() => import('./components/VibeMixer.vue'
 const ZenTimer = defineAsyncComponent(() => import('./components/ZenTimer.vue'))
 const FontSelector = defineAsyncComponent(() => import('./components/FontSelector.vue'))
 const ThemeToggle = defineAsyncComponent(() => import('./components/ThemeToggle.vue'))
+const TocPanel = defineAsyncComponent(() => import('./components/TocPanel.vue'))
+const MindMapPanel = defineAsyncComponent(() => import('./components/MindMapPanel.vue'))
 
 const AUTO_SAVE_IDLE_MS = 10000
 const SIDEBAR_OPEN_STORAGE_KEY = 'inner:sidebar-open'
@@ -21,11 +23,17 @@ const SIDEBAR_SEARCH_STORAGE_KEY = 'inner:sidebar-search'
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'inner:sidebar-collapsed'
 const DRAFT_STORAGE_PREFIX = 'inner:draft'
 
+import type { TocEntry } from './composables/useToc'
+
 type EditorHandle = {
   getMarkdown: () => string
   setMarkdown: (content: string) => Promise<void>
   burnAndClear: () => Promise<void>
   transitionTo: (content: string) => Promise<void>
+  scrollToPos: (pos: number) => void
+  replaceHeadingText: (pos: number, newText: string) => void
+  insertHeading: (afterPos: number, level: number, text: string) => void
+  deleteHeading: (pos: number) => void
 }
 
 type TopBarHandle = {
@@ -130,6 +138,11 @@ watch(currentScene, (value) => {
 
 // ── Editor content ──
 const editorRef = ref<EditorHandle | null>(null)
+const tocEntries = ref<TocEntry[]>([])
+const isTocOpen = ref(false)
+const isMindMapOpen = ref(false)
+const isMindMapFullscreen = ref(false)
+const currentMarkdown = ref('')
 const isFilePanelOpen = ref(localStorage.getItem(SIDEBAR_OPEN_STORAGE_KEY) === '1')
 const pendingFileTransition = ref(false)
 const deleteTarget = ref<string | null>(null)
@@ -211,6 +224,10 @@ watch(
     clearAutoSaveTimer()
     if (!editor) return
 
+    // Don't restore content while a burn is in progress — the burn already
+    // cleared the editor and the draft was pre-cleared before the animation.
+    if (isBurningCurrentFile.value) return
+
     const draftContent = file?.name ? readStoredDraft(file.name) : null
     const nextContent = draftContent ?? file?.content ?? ''
     const previousContent = previousFile?.content ?? ''
@@ -236,11 +253,13 @@ watch(
 
     if (pendingFileTransition.value && didSwitchFile) {
       await editor.transitionTo(nextContent)
+      currentMarkdown.value = nextContent
       pendingFileTransition.value = false
       return
     }
 
     await editor.setMarkdown(nextContent)
+    currentMarkdown.value = nextContent
     if (file?.name && draftContent !== null) {
       markDirty()
     }
@@ -466,13 +485,17 @@ async function handleBurnCurrentFile() {
   clearAutoSaveTimer()
   isBurningCurrentFile.value = true
 
+  // Clear the draft BEFORE the animation + save so that the watch callback
+  // triggered by saveFile() doesn't find a stale draft and restore old content.
+  const fileName = currentFile.value.name
+  clearStoredDraft(fileName)
+
   try {
     await editorRef.value.burnAndClear()
+    currentMarkdown.value = ''
+    tocEntries.value = []
     markDirty()
-    const ok = await saveFile('')
-    if (ok && currentFile.value) {
-      clearStoredDraft(currentFile.value.name)
-    }
+    await saveFile('')
   } finally {
     isBurningCurrentFile.value = false
   }
@@ -609,10 +632,40 @@ function handleEditorDirty() {
     const snapshot = editorRef.value?.getMarkdown()
     if (snapshot !== undefined) {
       writeStoredDraft(currentFile.value.name, snapshot)
+      currentMarkdown.value = snapshot
     }
   }
   scheduleAutoSave()
   scheduleTitleSync()
+}
+
+function handleTocUpdate(entries: TocEntry[]) {
+  tocEntries.value = entries
+}
+
+function handleTocJump(pos: number) {
+  editorRef.value?.scrollToPos(pos)
+}
+
+// ── MindMap event handlers ──
+function handleMindMapEditHeading(pos: number, newText: string) {
+  editorRef.value?.replaceHeadingText(pos, newText)
+  // currentMarkdown will update via handleEditorDirty which fires from Editor's emit('dirty')
+}
+
+function handleMindMapAddHeading(afterPos: number, level: number, text: string) {
+  editorRef.value?.insertHeading(afterPos, level, text)
+}
+
+function handleMindMapDeleteHeading(pos: number) {
+  editorRef.value?.deleteHeading(pos)
+}
+
+function syncCurrentMarkdown() {
+  const snapshot = editorRef.value?.getMarkdown()
+  if (snapshot !== undefined) {
+    currentMarkdown.value = snapshot
+  }
 }
 
 function toggleAudio() {
@@ -687,7 +740,8 @@ onMounted(() => {
       @toggle-directory="handleToggleDirectory"
     />
 
-    <!-- Layer 1: Top Bar -->
+    <!-- Layer 1: Top Bar (hidden during mindmap fullscreen) -->
+    <div :style="isMindMapFullscreen ? 'pointer-events: none; opacity: 0;' : ''">
     <TopBar
       ref="topBarRef"
       :scene="currentScene"
@@ -705,14 +759,35 @@ onMounted(() => {
         <FontSelector v-model="fontChoice" />
       </template>
     </TopBar>
+    </div>
 
     <!-- Layer 2: Frosted Glass Editor -->
-    <div class="editor-container">
+    <div class="editor-container" :class="{ 'split-mode': isMindMapOpen && !isMindMapFullscreen }">
       <div class="editor-glass" :style="{ '--glass-blur': glassBlur, '--editor-font': editorFontFamily }">
         <div class="editor-actions">
           <transition name="indicator-fade">
             <span v-if="isDirty" class="unsaved-dot" title="Unsaved changes" />
           </transition>
+          <button
+            class="editor-toc-btn"
+            :class="{ active: isTocOpen }"
+            :disabled="!currentFile"
+            @click="isTocOpen = !isTocOpen"
+            title="目录 (TOC)"
+            aria-label="Toggle table of contents"
+          >
+            TOC
+          </button>
+          <button
+            class="editor-mindmap-btn"
+            :class="{ active: isMindMapOpen }"
+            :disabled="!currentFile"
+            @click="isMindMapOpen = !isMindMapOpen"
+            title="思维导图"
+            aria-label="Toggle mind map"
+          >
+            Map
+          </button>
           <button
             class="editor-burn-btn"
             :disabled="isBurningCurrentFile || !currentFile"
@@ -737,9 +812,34 @@ onMounted(() => {
         <Editor
           ref="editorRef"
           @dirty="handleEditorDirty"
+          @toc-update="handleTocUpdate"
         />
       </div>
+
+      <!-- MindMap Panel (split-mode right pane) -->
+      <MindMapPanel
+        v-if="isMindMapOpen"
+        :markdown="currentMarkdown"
+        :toc-entries="tocEntries"
+        :visible="isMindMapOpen"
+        :fullscreen="isMindMapFullscreen"
+        :doc-title="currentFile?.name ? getFileTitleFromName(currentFile.name) : 'Document'"
+        @edit-heading="handleMindMapEditHeading"
+        @add-heading="handleMindMapAddHeading"
+        @delete-heading="handleMindMapDeleteHeading"
+        @jump="handleTocJump"
+        @toggle-fullscreen="isMindMapFullscreen = !isMindMapFullscreen"
+        @close="isMindMapOpen = false; isMindMapFullscreen = false"
+      />
     </div>
+
+    <!-- TOC Panel -->
+    <TocPanel
+      :entries="tocEntries"
+      :visible="isTocOpen"
+      @jump="handleTocJump"
+      @close="isTocOpen = false"
+    />
 
     <!-- Layer 3: Vibe Mixer (bottom-right) -->
     <VibeMixer
@@ -854,8 +954,27 @@ onMounted(() => {
 }
 
 /* Pass font family to editor via CSS variable */
-.editor-glass :deep(.milkdown-editor .ProseMirror) {
+.editor-glass :deep(.cm-editor-host .cm-scroller) {
   font-family: var(--editor-font, var(--font-sans));
+}
+
+/* ── Split mode: editor + mind map side by side ── */
+.editor-container.split-mode {
+  align-items: stretch;
+  justify-content: stretch;
+  gap: 16px;
+  padding: 60px 24px 24px;
+}
+
+.editor-container.split-mode .editor-glass {
+  max-width: none;
+  flex: 1;
+  min-width: 0;
+}
+
+/* MindMapPanel inherits pointer-events from its own styles */
+.editor-container.split-mode > :deep(.mindmap-panel) {
+  pointer-events: auto;
 }
 
 /* Editor actions */
@@ -940,6 +1059,73 @@ onMounted(() => {
 }
 
 .editor-burn-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+}
+
+.editor-toc-btn {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, var(--color-border-muted) 80%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-surface-solid) 82%, transparent);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all var(--transition-base);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.editor-toc-btn.active {
+  border-color: color-mix(in srgb, var(--color-accent) 60%, var(--color-border-muted));
+  color: var(--color-text-heading);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 16%, transparent);
+}
+
+.editor-toc-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--topbar-btn-hover-bg) 75%, var(--color-surface-solid));
+  transform: translateY(-1px);
+}
+
+.editor-toc-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+}
+
+.editor-mindmap-btn {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid color-mix(in srgb, #a78bfa 40%, var(--color-border-muted));
+  border-radius: 999px;
+  background: color-mix(in srgb, rgba(167, 139, 250, 0.1) 72%, var(--color-surface-solid));
+  color: #c4b5fd;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all var(--transition-base);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.editor-mindmap-btn.active {
+  border-color: color-mix(in srgb, #a78bfa 60%, var(--color-border-muted));
+  color: var(--color-text-heading);
+  box-shadow: 0 0 0 1px color-mix(in srgb, #a78bfa 20%, transparent);
+}
+
+.editor-mindmap-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, rgba(167, 139, 250, 0.18) 80%, var(--color-surface-solid));
+  color: var(--color-text-heading);
+  transform: translateY(-1px);
+}
+
+.editor-mindmap-btn:disabled {
   opacity: 0.5;
   cursor: default;
   transform: none;
@@ -1170,6 +1356,13 @@ onMounted(() => {
 
   .editor-glass {
     border-radius: var(--radius-xl);
+  }
+
+  /* On small screens, split mode stacks vertically */
+  .editor-container.split-mode {
+    flex-direction: column;
+    padding: 50px 12px 12px;
+    gap: 12px;
   }
 }
 </style>
