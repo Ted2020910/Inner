@@ -35,6 +35,7 @@ const { entries: tocEntries, update: updateToc } = useToc()
 defineExpose({
   getMarkdown,
   setMarkdown,
+  updateContent,
   burnAndClear,
   transitionTo,
   tocEntries,
@@ -398,6 +399,53 @@ async function setMarkdown(content: string) {
   triggerContentFadeIn()
 }
 
+/**
+ * Incrementally update the editor content while preserving cursor position and scroll.
+ * Use this for external file changes (e.g., from file watcher).
+ */
+function updateContent(newContent: string, cursorAnchor?: number, cursorHead?: number) {
+  if (!view.value) {
+    // If editor doesn't exist yet, just set pending content
+    pendingContent = newContent
+    return
+  }
+
+  const state = view.value.state
+  const currentContent = state.doc.toString()
+
+  // If content hasn't changed, do nothing
+  if (currentContent === newContent) return
+
+  // Save current cursor/scroll position
+  const scrollTop = editorRef.value?.querySelector('.cm-scroller')?.scrollTop ?? 0
+
+  // Try to preserve relative cursor position
+  const currentLength = currentContent.length
+  const newLength = newContent.length
+  const preserveCursor = cursorAnchor === undefined
+
+  view.value.dispatch({
+    changes: { from: 0, to: currentLength, insert: newContent },
+    // Try to keep cursor at relative position
+    selection: preserveCursor
+      ? undefined
+      : {
+          anchor: Math.min(cursorAnchor ?? 0, newLength),
+          head: Math.min(cursorHead ?? 0, newLength),
+        },
+    // Suppress dirty event for external updates
+    annotations: isProgrammaticAnnotation.of(true),
+  })
+
+  // Restore scroll position
+  nextTick(() => {
+    const scroller = editorRef.value?.querySelector('.cm-scroller')
+    if (scroller) {
+      scroller.scrollTop = scrollTop
+    }
+  })
+}
+
 async function playBurnAnimation(): Promise<boolean> {
   if (!editorRef.value) return false
 
@@ -512,6 +560,21 @@ onBeforeUnmount(() => {
 .cm-editor-host :deep(.cm-content) {
   min-height: 60vh;
   caret-color: var(--color-accent, #88c0d0);
+}
+
+/* Ordered list markers - ensure they're visible */
+.cm-editor-host :deep(.cm-content) ol,
+.cm-editor-host :deep(.cm-content) ul {
+  padding-left: 1.5em;
+}
+
+.cm-editor-host :deep(.cm-content) li {
+  padding-left: 0.25em;
+}
+
+.cm-editor-host :deep(.cm-content) li::marker {
+  color: var(--editor-marker-color, #94a3b8);
+  font-weight: 500;
 }
 
 /* ── Burn — text turns into smoke in place ── */

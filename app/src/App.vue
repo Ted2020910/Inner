@@ -233,6 +233,7 @@ watch(
     const previousContent = previousFile?.content ?? ''
     const didSwitchFile = Boolean(previousFile?.name && file?.name && previousFile.name !== file.name)
     const didContentChange = previousContent !== nextContent
+    const isExternalUpdate = !didSwitchFile && didContentChange && previousFile?.name === file?.name
     const didRenameOnly = Boolean(
       previousFile?.name
       && file?.name
@@ -258,6 +259,15 @@ watch(
       return
     }
 
+    // External file change: preserve cursor/scroll position (incremental update)
+    if (isExternalUpdate && editor.updateContent) {
+      editor.updateContent(nextContent)
+      currentMarkdown.value = nextContent
+      pendingFileTransition.value = false
+      return
+    }
+
+    // Normal file switch: full content reload (recreates editor)
     await editor.setMarkdown(nextContent)
     currentMarkdown.value = nextContent
     if (file?.name && draftContent !== null) {

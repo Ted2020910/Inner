@@ -36,4 +36,18 @@ export const nordTheme = EditorView.theme({
   '.cm-lineNumbers .cm-gutterElement': {
     padding: '0 8px 0 4px',
   },
+  // List styles - ensure ordered list markers are visible
+  '.cm-content ol': {
+    paddingLeft: '1.5em',
+  },
+  '.cm-content ul': {
+    paddingLeft: '1.5em',
+  },
+  '.cm-content li': {
+    paddingLeft: '0.25em',
+  },
+  '.cm-content li::marker': {
+    color: 'var(--editor-marker-color, #94a3b8)',
+    fontWeight: '500',
+  },
 }, { dark: true })
